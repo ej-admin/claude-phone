@@ -87,10 +87,13 @@ function buildClaudeEnvironment() {
     GOPATH: path.join(HOME, 'go'),
     PYENV_ROOT: path.join(HOME, '.pyenv'),
     BUN_INSTALL: path.join(HOME, '.bun'),
-    // CRITICAL: These tell Claude Code it's running in the proper environment
-    CLAUDECODE: '1',
-    CLAUDE_CODE_ENTRYPOINT: 'cli',
+    // NOTE: Do NOT set CLAUDECODE or CLAUDE_CODE_ENTRYPOINT here
+    // Setting these causes "cannot be launched inside another Claude Code session" errors
   };
+
+  // Remove these if inherited from parent process
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
 
   // CRITICAL: Remove ANTHROPIC_API_KEY so Claude CLI uses subscription auth
   // If ANTHROPIC_API_KEY is set (even to placeholder), CLI tries API auth instead
