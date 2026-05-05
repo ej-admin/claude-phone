@@ -483,6 +483,226 @@ app.post('/end-session', (req, res) => {
   res.json({ success: true });
 });
 
+// ============================================
+// HOME-972: OUTBOUND CALL PROXY
+// ============================================
+//
+// Capability: Ralph (and other agents) can trigger an outbound call to Jeff
+// via the Pi voice-app. This endpoint proxies POST /outbound-call requests
+// from x1pro consumers to the Pi voice-app at ai-phone:3000/api/outbound-call.
+//
+// WHY a proxy: consumers (mcp-telephony-server, ralph-supervisor, n8n)
+// shouldn't need to know the Pi's network address or its API contract. They
+// hit a stable x1pro endpoint and we forward.
+//
+// AUDIT TRAIL: every call attempt is logged to stdout AND appended to
+// logs/outbound-calls.jsonl (mounted volume) so we have a persistent record
+// of every outbound call. Required by Ralph escalation rules.
+//
+// Pi API contract (per voice-app/README-OUTBOUND.md):
+//   POST http://ai-phone:3000/api/outbound-call
+//   { to, message, mode: 'announce'|'conversation', device, callerId,
+//     timeoutSeconds, webhookUrl }
+
+const VOICE_APP_URL = process.env.VOICE_APP_URL || 'http://ai-phone:3000';
+const OUTBOUND_LOG_PATH =
+  process.env.OUTBOUND_LOG_PATH ||
+  path.join(__dirname, 'logs', 'outbound-calls.jsonl');
+
+// Mode aliasing: HOME-972 task spec uses 'tts' / 'interactive', Pi voice-app
+// uses 'announce' / 'conversation'. Accept both for ergonomics.
+function normalizeMode(mode) {
+  if (!mode) return 'announce';
+  const m = String(mode).toLowerCase();
+  if (m === 'tts' || m === 'announce') return 'announce';
+  if (m === 'interactive' || m === 'conversation') return 'conversation';
+  // Unknown mode: return null so caller emits a 400
+  return null;
+}
+
+// E.164 validation: + followed by 8-15 digits. Strict enough to catch typos
+// without being so strict it rejects valid international numbers.
+function isValidE164(s) {
+  return typeof s === 'string' && /^\+[1-9]\d{7,14}$/.test(s);
+}
+
+function appendOutboundLog(entry) {
+  try {
+    if (!fs.existsSync(path.dirname(OUTBOUND_LOG_PATH))) {
+      fs.mkdirSync(path.dirname(OUTBOUND_LOG_PATH), { recursive: true });
+    }
+    fs.appendFileSync(OUTBOUND_LOG_PATH, JSON.stringify(entry) + '\n');
+  } catch (err) {
+    console.error(`[outbound-call] audit log write failed: ${err.message}`);
+  }
+}
+
+/**
+ * POST /outbound-call
+ *
+ * Trigger an outbound call to a phone number. Proxies to Pi voice-app.
+ *
+ * Request body:
+ *   {
+ *     "to": "+19033002001",        // E.164, required
+ *     "message": "...",             // text to speak, required, max 1000 chars
+ *     "mode": "tts"|"interactive"   // optional, default 'tts' (announce)
+ *                                    // also accepts 'announce'|'conversation'
+ *     "device": "Morpheus",         // optional device/voice
+ *     "callerId": "+15551234567",   // optional caller ID
+ *     "timeoutSeconds": 30,         // optional ring timeout
+ *     "webhookUrl": "...",          // optional status webhook
+ *     "triggeredBy": "ralph"        // optional: who triggered (audit)
+ *   }
+ *
+ * Response:
+ *   { success: true, callId, status, message }
+ *   or { success: false, error }
+ */
+app.post('/outbound-call', async (req, res) => {
+  const startTime = Date.now();
+  const timestamp = new Date().toISOString();
+  const {
+    to,
+    message,
+    mode,
+    device,
+    callerId,
+    timeoutSeconds,
+    webhookUrl,
+    triggeredBy,
+  } = req.body || {};
+
+  // ── Input validation ──────────────────────────────────────────────────
+  if (!isValidE164(to)) {
+    return res
+      .status(400)
+      .json({ success: false, error: 'Invalid phone number — must be E.164 format (+15551234567)' });
+  }
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ success: false, error: 'message is required (string)' });
+  }
+  if (message.length > 1000) {
+    return res
+      .status(400)
+      .json({ success: false, error: `message too long (${message.length} > 1000 chars)` });
+  }
+  const normalizedMode = normalizeMode(mode);
+  if (mode != null && normalizedMode === null) {
+    return res
+      .status(400)
+      .json({ success: false, error: `Invalid mode: ${mode} (use tts|interactive)` });
+  }
+
+  // ── Build Pi request ──────────────────────────────────────────────────
+  const piPayload = {
+    to,
+    message,
+    mode: normalizedMode,
+  };
+  if (device) piPayload.device = device;
+  if (callerId) piPayload.callerId = callerId;
+  if (typeof timeoutSeconds === 'number') piPayload.timeoutSeconds = timeoutSeconds;
+  if (webhookUrl) piPayload.webhookUrl = webhookUrl;
+
+  console.log(
+    `[${timestamp}] OUTBOUND CALL → ${to} mode=${normalizedMode} ` +
+      `triggered_by=${triggeredBy || 'unknown'} (msg: ${message.slice(0, 60)}…)`
+  );
+
+  // ── Proxy to Pi ───────────────────────────────────────────────────────
+  let piResponse;
+  let piResult;
+  let piError = null;
+  try {
+    piResponse = await fetch(`${VOICE_APP_URL}/api/outbound-call`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(piPayload),
+      // 15s — Pi just enqueues; the call itself takes longer to ring
+      signal: AbortSignal.timeout(15000),
+    });
+    piResult = await piResponse.json();
+  } catch (err) {
+    piError = err.message || String(err);
+  }
+
+  const durationMs = Date.now() - startTime;
+  const auditEntry = {
+    timestamp,
+    direction: 'outbound',
+    to,
+    mode: normalizedMode,
+    message_preview: message.slice(0, 80),
+    triggered_by: triggeredBy || null,
+    pi_status: piResponse ? piResponse.status : null,
+    pi_call_id: piResult ? piResult.callId : null,
+    pi_error: piError,
+    duration_ms: durationMs,
+  };
+  appendOutboundLog(auditEntry);
+
+  if (piError) {
+    console.error(
+      `[${timestamp}] OUTBOUND CALL FAILED → ${to}: ${piError} (${durationMs}ms)`
+    );
+    return res
+      .status(502)
+      .json({ success: false, error: `voice-app proxy failed: ${piError}` });
+  }
+
+  if (!piResponse.ok || !piResult.success) {
+    console.error(
+      `[${timestamp}] OUTBOUND CALL REJECTED → ${to}: ${piResult.error || 'unknown'} (${durationMs}ms)`
+    );
+    return res.status(piResponse.status).json(piResult);
+  }
+
+  console.log(
+    `[${timestamp}] OUTBOUND CALL QUEUED → ${to} callId=${piResult.callId} (${durationMs}ms)`
+  );
+  res.json({
+    success: true,
+    callId: piResult.callId,
+    status: piResult.status,
+    message: piResult.message || 'Call initiated',
+    duration_ms: durationMs,
+  });
+});
+
+/**
+ * GET /outbound-call/:callId
+ * Proxy to Pi for call status lookup.
+ */
+app.get('/outbound-call/:callId', async (req, res) => {
+  const { callId } = req.params;
+  try {
+    const r = await fetch(`${VOICE_APP_URL}/api/call/${encodeURIComponent(callId)}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    const result = await r.json();
+    res.status(r.status).json(result);
+  } catch (err) {
+    res.status(502).json({ success: false, error: `voice-app proxy failed: ${err.message}` });
+  }
+});
+
+/**
+ * GET /outbound-calls
+ * Proxy to Pi for active call list.
+ */
+app.get('/outbound-calls', async (req, res) => {
+  try {
+    const r = await fetch(`${VOICE_APP_URL}/api/calls`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    const result = await r.json();
+    res.status(r.status).json(result);
+  } catch (err) {
+    res.status(502).json({ success: false, error: `voice-app proxy failed: ${err.message}` });
+  }
+});
+
 /**
  * GET /health
  * Health check endpoint
@@ -506,6 +726,9 @@ app.get('/', (req, res) => {
     endpoints: {
       'POST /ask': 'Send a prompt to Claude',
       'POST /ask-structured': 'Send a prompt and return validated JSON (n8n)',
+      'POST /outbound-call': 'Trigger outbound call via Pi voice-app (HOME-972)',
+      'GET /outbound-call/:callId': 'Get outbound call status',
+      'GET /outbound-calls': 'List active outbound calls',
       'GET /health': 'Health check'
     }
   });
