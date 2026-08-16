@@ -8,12 +8,11 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const logger = require('./logger');
+const { resolveVoiceId } = require('./resolve-voice-id');
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_API_URL = 'https://api.elevenlabs.io/v1';
 
-// Default voice IDs (can be customized)
-const DEFAULT_VOICE_ID = 'JAgnJveGGUh4qy4kh6dF'; // Morpheus voice
 const MODEL_ID = 'eleven_turbo_v2'; // Fast, low-latency model
 
 // Audio output directory (set via setAudioDir)
@@ -51,7 +50,7 @@ function generateFilename(text) {
  * @param {string} voiceId - ElevenLabs voice ID (optional)
  * @returns {Promise<string>} HTTP URL to audio file
  */
-async function generateSpeech(text, voiceId = DEFAULT_VOICE_ID) {
+async function generateSpeech(text, voiceId) {
   const startTime = Date.now();
 
   try {
@@ -59,16 +58,18 @@ async function generateSpeech(text, voiceId = DEFAULT_VOICE_ID) {
       throw new Error('ELEVENLABS_API_KEY environment variable not set');
     }
 
+    const resolvedVoiceId = resolveVoiceId(voiceId);
+
     logger.info('Generating speech with ElevenLabs', {
       textLength: text.length,
-      voiceId,
+      voiceId: resolvedVoiceId,
       model: MODEL_ID
     });
 
     // Call ElevenLabs API
     const response = await axios({
       method: 'POST',
-      url: `${ELEVENLABS_API_URL}/text-to-speech/${voiceId}`,
+      url: `${ELEVENLABS_API_URL}/text-to-speech/${resolvedVoiceId}`,
       headers: {
         'Accept': 'audio/mpeg',
         'Content-Type': 'application/json',
