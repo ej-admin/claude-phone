@@ -238,10 +238,23 @@ async function initiateOutboundCall(srf, mediaServer, options) {
   } catch (error) {
     const latency = Date.now() - startTime;
 
+    // HOME-5409: drachtio-srf's SipError carries an optional `.reason` --
+    // the actual SIP reason phrase text (e.g. a 503's specific cause) --
+    // separate from `.message`, which is always the generic
+    // 'Sip non-success response: <status>'. That reason text was never
+    // logged before, so a 503 rejected by the SBC/PBX for a SPECIFIC,
+    // diagnosable cause (bad routing rule, no matching outbound trunk,
+    // licensing, etc.) looked identical in the logs to a generic,
+    // unexplained 503. Log it whenever present -- this is the same "loud
+    // failure" fix as the auth/trunk checks above, applied to the SIP
+    // response path itself.
     logger.error('Outbound call failed', {
       callId,
       to,
       error: error.message,
+      sipReason: error.reason || null,
+      sipStatus: error.status || null,
+      isRinging,
       latency
     });
 
