@@ -47,11 +47,20 @@ class OutboundSession extends EventEmitter {
     this.conversationHistory = [];
     this.turnCount = 0;
 
-    // Register in active sessions
-    activeSessions.set(callId, this);
+    // Register in active sessions.
+    // HOME-5409: this MUST be this.callId, not the raw `callId` constructor
+    // param -- the sole call site (outbound-routes.js) always passes null
+    // here specifically so a UUID gets generated, which meant every session
+    // was ALWAYS stored under key `null` and getSession(realCallId) could
+    // never find it. GET /call/:callId has returned 'not_found' for every
+    // outbound call ever placed via this path, including calls that were
+    // fully answered -- confirmed live: "Outbound session created
+    // {\"callId\":null,...}" in production logs is this exact bug caught
+    // in the act, not a hypothetical.
+    activeSessions.set(this.callId, this);
 
     logger.info('Outbound session created', {
-      callId,
+      callId: this.callId,
       to: this.to,
       mode: this.mode,
       state: this.state
