@@ -96,6 +96,17 @@ async function initiateOutboundCall(srf, mediaServer, options) {
     const sipTrunkHost = process.env.SIP_TRUNK_HOST || process.env.SIP_REGISTRAR;
     const externalIp = process.env.EXTERNAL_IP || '10.70.7.81';
     const defaultCallerId = callerId || process.env.DEFAULT_CALLER_ID || '+15551234567';
+    // HOME-5417 round 2 (2026-08-16): the request URI carried no transport
+    // parameter, so drachtio's default (tcp) was used to dial the local SBC.
+    // Confirmed live on the Pi: `3cxsbc.service` listens on UDP/5060 ONLY
+    // (`ss -lntup` shows udp UNCONN 0.0.0.0:5060), while drachtio logged
+    // "INVITE ... Connection refused (111) with tcp/[127.0.0.1]:5060" --
+    // a local connect-refuse synthesized in ~30ms, never reaching 3CX cloud
+    // at all. That is why every prior "503 Service Unavailable" was too fast
+    // for a real round-trip. Default to udp (the SBC's only listener);
+    // SIP_TRANSPORT lets a future deployment override without another code
+    // edit if the SBC's transport ever changes.
+    const sipTransport = process.env.SIP_TRANSPORT || 'udp';
 
     if (!sipTrunkHost) {
       // Loud, immediate, and distinct from every SIP-layer failure below --
@@ -120,7 +131,7 @@ async function initiateOutboundCall(srf, mediaServer, options) {
     const sipAuthUsername = process.env.SIP_AUTH_ID;
     const sipAuthPassword = process.env.SIP_PASSWORD;
 
-    const sipUri = 'sip:' + phoneNumber + '@' + sipTrunkHost;
+    const sipUri = 'sip:' + phoneNumber + '@' + sipTrunkHost + ';transport=' + sipTransport;
 
     logger.info('Dialing SIP URI', {
       callId,
@@ -143,9 +154,13 @@ async function initiateOutboundCall(srf, mediaServer, options) {
       ? deviceConfig.extension
       : (process.env.SIP_EXTENSION || defaultCallerId.replace('+', ''));
     const displayName = deviceConfig ? deviceConfig.name : null;
+    // HOME-5417 round 2: same missing-transport omission as the request URI
+    // above -- the From-header URI is a SIP URI too, and an inconsistent
+    // (or absent, i.e. transport-guessed) transport param here can itself
+    // cause a UAS/SBC to reject or mis-route. Keep it in lockstep with sipUri.
     const fromHeader = displayName
-      ? '"' + displayName + '" <sip:' + fromExtension + '@' + sipTrunkHost + '>'
-      : '<sip:' + fromExtension + '@' + sipTrunkHost + '>';
+      ? '"' + displayName + '" <sip:' + fromExtension + '@' + sipTrunkHost + ';transport=' + sipTransport + '>'
+      : '<sip:' + fromExtension + '@' + sipTrunkHost + ';transport=' + sipTransport + '>';
 
     const uacOptions = {
       localSdp: localSdp,
