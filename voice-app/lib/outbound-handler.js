@@ -37,6 +37,14 @@ async function initiateOutboundCall(srf, mediaServer, options) {
   const callId = uuidv4();
   const startTime = Date.now();
 
+  // Declared above the try block (not just inside it) so the catch handler
+  // below can inspect isRinging to tell "the far end never even sent a
+  // provisional response" apart from "it rang and nobody picked up" --
+  // both currently 408/480 at the SIP layer but very different failures
+  // (HOME-5409).
+  let isRinging = false;
+  let callAnswered = false;
+
   try {
     logger.info('Initiating outbound call', {
       callId,
@@ -57,13 +65,46 @@ async function initiateOutboundCall(srf, mediaServer, options) {
     // Internal extensions: dial as-is. External (E.164 with +): add 9 prefix for PSTN
     const isExternal = to.startsWith('+');
     const phoneNumber = isExternal ? '9' + to.replace(/^\+1?/, '') : to;
-    const sipTrunkHost = process.env.SIP_TRUNK_HOST || '10.70.7.50';
+    // HOME-5409: this deployment runs the "SBC-everywhere" model (see
+    // src/features/sbc-simplified-installer/SPEC.md) -- voice-app registers
+    // with a LOCAL 3CX SBC (SIP_REGISTRAR), which is the only thing that
+    // actually talks to the 3CX cloud PBX / PSTN. Outbound INVITEs must
+    // therefore go to that SAME local SBC, not to a separate "trunk" host --
+    // there is no separate trunk in this architecture. The previous default
+    // ('10.70.7.50') was an unreachable, unowned placeholder IP (part of the
+    // same 10.70.7.x template-default family as the old EXTERNAL_IP default
+    // below) that nothing in this deployment's network ever routed to --
+    // confirmed via SIP_REGISTRAR=127.0.0.1 + `3cxsbc.service` listening on
+    // 0.0.0.0:5060 on the Pi (ADV-6833 follow-up investigation). No separate
+    // SIP_TRUNK_HOST value has ever been documented or configured anywhere
+    // in this repo, so falling back to SIP_REGISTRAR is not a guess -- it is
+    // the only address this deployment's SIP signaling has ever used.
+    const sipTrunkHost = process.env.SIP_TRUNK_HOST || process.env.SIP_REGISTRAR;
     const externalIp = process.env.EXTERNAL_IP || '10.70.7.81';
     const defaultCallerId = callerId || process.env.DEFAULT_CALLER_ID || '+15551234567';
 
-    // SIP Authentication for 3CX extension registration
-    const sipAuthUsername = process.env.SIP_AUTH_USERNAME;
-    const sipAuthPassword = process.env.SIP_AUTH_PASSWORD;
+    if (!sipTrunkHost) {
+      // Loud, immediate, and distinct from every SIP-layer failure below --
+      // there is nothing to dial. Do NOT let this fall through to a SIP
+      // attempt against an empty/undefined host.
+      logger.error('No SIP trunk target configured', {
+        callId,
+        checked: ['SIP_TRUNK_HOST', 'SIP_REGISTRAR']
+      });
+      throw new Error('sip_trunk_not_configured');
+    }
+
+    // SIP Authentication for 3CX extension registration.
+    // HOME-5409: these MUST match the names the container actually sets
+    // (confirmed live on the Pi's .env: SIP_AUTH_ID + SIP_PASSWORD --
+    // same pair documented in .env.example and used by every other
+    // SIP-auth consumer in this repo, e.g. voice-app/index.js). The prior
+    // names (SIP_AUTH_USERNAME / SIP_AUTH_PASSWORD) matched nothing the
+    // container ever set, so authUsername/authPassword below were silently
+    // undefined on every default-identity call -- no Authorization header
+    // was ever attached to the INVITE.
+    const sipAuthUsername = process.env.SIP_AUTH_ID;
+    const sipAuthPassword = process.env.SIP_PASSWORD;
 
     const sipUri = 'sip:' + phoneNumber + '@' + sipTrunkHost;
 
@@ -75,8 +116,18 @@ async function initiateOutboundCall(srf, mediaServer, options) {
     });
 
     // STEP 2: Create UAC (outbound call) with Early Offer
-    // Use device extension and display name if available, otherwise fall back to callerId
-    const fromExtension = deviceConfig ? deviceConfig.extension : defaultCallerId.replace('+', '');
+    // Use device extension and display name if available, otherwise fall
+    // back to SIP_EXTENSION (the "Default extension for outbound calls"
+    // per .env.example) -- NOT defaultCallerId. defaultCallerId is an E.164
+    // PSTN caller-ID string (e.g. +15551234567), not a registered 3CX
+    // extension; using it as the From-URI user part put an unregistered,
+    // unauthenticated identity in the From header while auth (once fixed
+    // above) authenticates as SIP_EXTENSION -- an identity mismatch most
+    // SBCs will reject independent of whether auth itself is correct
+    // (HOME-5409).
+    const fromExtension = deviceConfig
+      ? deviceConfig.extension
+      : (process.env.SIP_EXTENSION || defaultCallerId.replace('+', ''));
     const displayName = deviceConfig ? deviceConfig.name : null;
     const fromHeader = displayName
       ? '"' + displayName + '" <sip:' + fromExtension + '@' + sipTrunkHost + '>'
@@ -105,10 +156,22 @@ async function initiateOutboundCall(srf, mediaServer, options) {
         username: authUsername,
         device: deviceConfig ? deviceConfig.name : 'default'
       });
+    } else {
+      // HOME-5409: this is the exact failure ADV-6833's real test call hit --
+      // no auth credentials resolved, so the INVITE went out unauthenticated,
+      // the SBC never responded, and drachtio's client-side timeout produced
+      // a 408 that the catch block below mapped to the bland 'no_answer' --
+      // indistinguishable from Jeff genuinely not picking up. Fail loud and
+      // BEFORE dialing instead: this is a configuration defect, not a normal
+      // call outcome, and must never wear that label again.
+      logger.error('No SIP auth credentials resolved -- refusing to dial unauthenticated', {
+        callId,
+        device: deviceConfig ? deviceConfig.name : 'default (env-based)',
+        checkedEnvVars: deviceConfig ? null : ['SIP_AUTH_ID', 'SIP_PASSWORD'],
+        checkedDeviceFields: deviceConfig ? ['authId', 'password'] : null
+      });
+      throw new Error('sip_auth_not_configured');
     }
-
-    let isRinging = false;
-    let callAnswered = false;
 
     // Create the outbound call (returns dialog directly, not { uas, uac })
     const uac = await srf.createUAC(sipUri, uacOptions, {
@@ -188,9 +251,18 @@ async function initiateOutboundCall(srf, mediaServer, options) {
       if (status === 486) {
         throw new Error('busy');
       } else if (status === 480 || status === 408) {
-        throw new Error('no_answer');
+        // HOME-5409: 408/480 is ambiguous by itself -- it covers both "rang
+        // and timed out" and "the request never got a response at all"
+        // (e.g. dropped by the SBC for a bad/mismatched identity). isRinging
+        // is the discriminator: it's only ever set true on a real 180
+        // Ringing provisional. If we never saw one, this was never a normal
+        // "no answer" -- surface it as a distinct signaling failure so it
+        // can't be misread as "Jeff didn't pick up."
+        throw new Error(isRinging ? 'no_answer' : 'no_signaling_response');
       } else if (status === 404) {
         throw new Error('not_found');
+      } else if (status === 403) {
+        throw new Error('forbidden');
       } else if (status === 503) {
         throw new Error('service_unavailable');
       } else if (status === 401 || status === 407) {

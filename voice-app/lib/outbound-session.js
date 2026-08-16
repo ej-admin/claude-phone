@@ -33,6 +33,11 @@ class OutboundSession extends EventEmitter {
     this.createdAt = Date.now();
     this.answeredAt = null;
     this.endedAt = null;
+    // HOME-5409: last transition reason, surfaced via getInfo() so a FAILED
+    // call's reason (e.g. 'sip_auth_not_configured', 'no_signaling_response')
+    // is visible to external callers polling GET /call/:callId -- not just
+    // buried in server logs. Without this, "loud" only reached the log file.
+    this.lastReason = null;
 
     // Media objects
     this.endpoint = null;
@@ -67,6 +72,9 @@ class OutboundSession extends EventEmitter {
     }
 
     this.state = newState;
+    if (reason) {
+      this.lastReason = reason;
+    }
 
     const logData = {
       callId: this.callId,
@@ -275,7 +283,8 @@ class OutboundSession extends EventEmitter {
       createdAt: new Date(this.createdAt).toISOString(),
       answeredAt: this.answeredAt ? new Date(this.answeredAt).toISOString() : null,
       endedAt: this.endedAt ? new Date(this.endedAt).toISOString() : null,
-      duration: this.getDuration()
+      duration: this.getDuration(),
+      reason: this.lastReason
     };
 
     // Include conversation stats for conversation mode
