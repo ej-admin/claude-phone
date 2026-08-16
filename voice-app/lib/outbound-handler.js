@@ -62,9 +62,23 @@ async function initiateOutboundCall(srf, mediaServer, options) {
 
     // Format SIP URI for 3CX
     // Remove '+' from E.164 format for SIP URI
-    // Internal extensions: dial as-is. External (E.164 with +): add 9 prefix for PSTN
+    // Internal extensions: dial as-is. External (E.164 with +): prepend the
+    // configured trunk-access prefix for PSTN.
+    // HOME-5417: this prefix was hardcoded to '9' (an on-prem-PBX
+    // trunk-access-code convention inherited from the original NetworkChuck
+    // template) with no way to disable it. Jeff's tenant is a 3CX CLOUD PBX
+    // (1115.3cx.cloud); cloud deployments frequently have no dial-9 outbound
+    // rule at all, and a hardcoded assumption about someone else's dial plan
+    // is exactly what produced the undiagnosed SIP 503 this env var exists to
+    // let us test against. Default '9' preserves the pre-existing behavior
+    // for any on-prem PBX deployment of this template; set
+    // SIP_TRUNK_ACCESS_PREFIX='' (empty string) to dial the bare E.164
+    // digits with no prefix.
+    const trunkAccessPrefix = process.env.SIP_TRUNK_ACCESS_PREFIX !== undefined
+      ? process.env.SIP_TRUNK_ACCESS_PREFIX
+      : '9';
     const isExternal = to.startsWith('+');
-    const phoneNumber = isExternal ? '9' + to.replace(/^\+1?/, '') : to;
+    const phoneNumber = isExternal ? trunkAccessPrefix + to.replace(/^\+1?/, '') : to;
     // HOME-5409: this deployment runs the "SBC-everywhere" model (see
     // src/features/sbc-simplified-installer/SPEC.md) -- voice-app registers
     // with a LOCAL 3CX SBC (SIP_REGISTRAR), which is the only thing that
