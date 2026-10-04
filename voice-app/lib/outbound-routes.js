@@ -11,6 +11,7 @@ const logger = require('./logger');
 const { OutboundSession, getSession, getAllSessions } = require('./outbound-session');
 const { initiateOutboundCall, playMessage, hangupCall } = require('./outbound-handler');
 const { runConversationLoop } = require('./conversation-loop');
+const { shouldRequireAck, announceWithAck } = require('./ack-capture');
 
 // Dependencies injected via setupRoutes()
 var srf = null;
@@ -86,6 +87,19 @@ function validateRequest(body) {
     }
   }
 
+  // HOME-10660: acknowledgement opt-in
+  if (body.requireAck !== undefined && typeof body.requireAck !== 'boolean') {
+    return { valid: false, error: 'Field "requireAck" must be a boolean' };
+  }
+
+  if (body.requireAck === true && body.mode === 'conversation') {
+    return { valid: false, error: 'Field "requireAck" is only supported in announce mode (conversation mode owns DTMF itself)' };
+  }
+
+  if (body.triggeredBy !== undefined && (typeof body.triggeredBy !== 'string' || body.triggeredBy.length > 100)) {
+    return { valid: false, error: 'Field "triggeredBy" must be a string of 100 characters or less' };
+  }
+
   return { valid: true };
 }
 
@@ -101,6 +115,10 @@ function validateRequest(body) {
  *   - device: Device extension or name for voice/personality (optional)
  *   - callerId: Caller ID (optional)
  *   - timeoutSeconds: Ring timeout (optional, default: 30)
+ *   - requireAck: boolean (optional, announce mode only) - append "Press 1 to acknowledge",
+ *     listen for DTMF 1, and report it as `ack` on GET /api/call/:id (HOME-10660)
+ *   - triggeredBy: who placed the call (optional). A value on OUTBOUND_ACK_TRIGGERS
+ *     (default: telegram-drainer-escalation) implies requireAck unless requireAck:false
  */
 router.post('/outbound-call', async function(req, res) {
   var startTime = Date.now();
@@ -130,6 +148,9 @@ router.post('/outbound-call', async function(req, res) {
     var callerId = req.body.callerId;
     var timeoutSeconds = req.body.timeoutSeconds || 30;
     var webhookUrl = req.body.webhookUrl;
+    // HOME-10660: ack capture is announce-mode only; an allow-listed triggeredBy on a
+    // conversation call does not request one (the loop owns DTMF there).
+    var ackRequired = mode === 'announce' && shouldRequireAck(req.body);
 
     // Look up device configuration
     var deviceConfig = null;
@@ -187,6 +208,7 @@ router.post('/outbound-call', async function(req, res) {
       mode: mode,
       callerId: callerId,
       webhookUrl: webhookUrl,
+      requireAck: ackRequired,
       device: deviceConfig ? deviceConfig.name : null
     });
 
@@ -198,7 +220,9 @@ router.post('/outbound-call', async function(req, res) {
       mode: mode,
       device: deviceConfig ? deviceConfig.name : 'default',
       messageLength: message.length,
-      hasContext: !!context
+      hasContext: !!context,
+      ackRequired: ackRequired,
+      triggeredBy: req.body.triggeredBy || undefined
     });
 
     // Return immediately with callId
@@ -232,6 +256,23 @@ router.post('/outbound-call', async function(req, res) {
 
         // Play the initial message with device voice
         var voiceId = (deviceConfig && deviceConfig.voiceId) ? deviceConfig.voiceId : null;
+
+        if (ackRequired) {
+          // HOME-10660: message + "Press 1 to acknowledge", then listen for DTMF 1.
+          // The ack lands on the session the instant it is heard; the outcome below
+          // only decides how the call ENDS (acknowledged vs ack_timeout), never the ack.
+          var ack = await announceWithAck({
+            endpoint: endpoint,
+            session: session,
+            message: message,
+            voiceId: voiceId,
+            playMessage: playMessage
+          });
+          await hangupCall(dialog, endpoint, callId);
+          session.transition('COMPLETED', ack ? 'acknowledged' : 'ack_timeout');
+          return;
+        }
+
         await playMessage(endpoint, message, { voiceId: voiceId });
 
         if (mode === 'announce') {
@@ -257,7 +298,12 @@ router.post('/outbound-call', async function(req, res) {
               initialContext: message,
               context: context,           // NEW: pass structured context
               skipGreeting: true,
-              maxTurns: 20
+              maxTurns: 20,
+              // HOME-10660: recordTurn() was defined but never called, so the
+              // conversation stats on GET /api/call/:id were always empty.
+              onTurn: function(userText, assistantText) {
+                session.recordTurn(userText, assistantText);
+              }
             });
 
             await hangupCall(dialog, endpoint, callId);
