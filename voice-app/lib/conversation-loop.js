@@ -122,6 +122,7 @@ function extractVoiceLine(response) {
  * @param {string} [options.initialContext] - Context for outbound calls (why we're calling)
  * @param {boolean} [options.skipGreeting=false] - Skip greeting (for outbound, greeting already played)
  * @param {number} [options.maxTurns=20] - Maximum conversation turns
+ * @param {Function} [options.onTurn] - (userText, assistantText) called after each completed turn
  * @returns {Promise<void>}
  */
 async function runConversationLoop(endpoint, dialog, callUuid, options) {
@@ -134,7 +135,8 @@ async function runConversationLoop(endpoint, dialog, callUuid, options) {
     initialContext = null,
     skipGreeting = false,
     deviceConfig = null,
-    maxTurns = 20
+    maxTurns = 20,
+    onTurn = null
   } = options;
 
   // Extract devicePrompt and voiceId from deviceConfig (for Cephanie etc)
@@ -384,6 +386,16 @@ async function runConversationLoop(endpoint, dialog, callUuid, options) {
 
       const responseUrl = await ttsService.generateSpeech(voiceLine, voiceId);
       if (callActive) await endpoint.play(responseUrl);
+
+      // Report the completed turn (HOME-10660). Pure bookkeeping: a failure here must
+      // never end a live conversation.
+      if (typeof onTurn === 'function') {
+        try {
+          onTurn(transcript, voiceLine);
+        } catch (err) {
+          logger.warn('onTurn callback failed', { callUuid, error: err.message });
+        }
+      }
 
       logger.info('Turn complete', { callUuid, turn: turnCount });
     }

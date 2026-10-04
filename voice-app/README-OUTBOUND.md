@@ -39,6 +39,8 @@ Initiate an outbound call.
 | `callerId` | No | Caller ID to display |
 | `timeoutSeconds` | No | Ring timeout 5-120 (default: 30) |
 | `webhookUrl` | No | URL for status callbacks |
+| `requireAck` | No | `true` (announce mode only): append "Press 1 to acknowledge" and record the keypress. See [Acknowledgement](#acknowledgement-dtmf-1) |
+| `triggeredBy` | No | Who placed the call (max 100 chars). A value on `OUTBOUND_ACK_TRIGGERS` implies `requireAck` unless `requireAck:false` |
 
 **Response:**
 
@@ -141,6 +143,34 @@ curl -X POST http://localhost:3000/api/outbound-call \
     "device": "Morpheus"
   }'
 ```
+
+## Acknowledgement (DTMF 1)
+
+An answered call does not prove a person heard it: an answering machine also picks up.
+For calls that must reach a human (escalations), the voice-app can ask the listener to
+press 1 and report whether they did.
+
+A call asks for this when `requireAck` is `true`, or when `triggeredBy` is on the
+allow-list `OUTBOUND_ACK_TRIGGERS` (default: `telegram-drainer-escalation`) and
+`requireAck` is not `false`. Announce mode only. The spoken script becomes the message
+followed by "Press 1 to acknowledge." The voice-app then listens for up to
+`OUTBOUND_ACK_TIMEOUT_MS` (default 10000) after the prompt; pressing 1 during the
+message also counts. On acknowledgement it plays a short confirmation and hangs up.
+
+The call record (`GET /api/call/:callId`, under `data`) reports the result in `ack`:
+
+| `ack` value | Meaning |
+|-------------|---------|
+| `{ "method": "dtmf", "digit": "1", "at": "<ISO timestamp>" }` | A person pressed 1 |
+| `null` | The call listened and heard no acknowledgement (so far) |
+| key absent | The call did not ask for an acknowledgement and never listened |
+
+`ackRequested` (boolean) is always present. An acknowledged call ends `completed` with
+`reason: "acknowledged"`; an unacknowledged one ends `completed` with `reason: "ack_timeout"`.
+
+Only DTMF delivered to the call as RFC2833 telephone-events is detected. In-band DTMF
+detection is not enabled, so a carrier path that converts digits to in-band audio will not
+register an acknowledgement.
 
 ## Webhooks
 
