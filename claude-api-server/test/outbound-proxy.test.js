@@ -356,13 +356,19 @@ test('C3: POST: a 2xx with a JSON primitive / array body is a 504 "status unknow
   assert.equal(asArray.status, 504);
 });
 
-test('C4: POST: a voice-app 503 with an unparseable body means "not accepted" -> 502 (safe to retry)', async () => {
+test('C4: POST: ANY voice-app response whose body is not a JSON object is a 504 "status unknown" (a 5xx/4xx we cannot read does not prove no call was queued)', async () => {
   voiceApp.onPost = (req, res) => reply(res, 503, 'upstream unavailable', 'text/plain');
+  const fiveHundred = await post(proxy, { to: ALLOWED, message: 'hello' });
+  voiceApp.onPost = (req, res) => reply(res, 404, '<html>nope</html>', 'text/html');
+  const fourHundred = await post(proxy, { to: ALLOWED, message: 'hello' });
+  voiceApp.onPost = (req, res) => reply(res, 500, 'null');
+  const nullBody = await post(proxy, { to: ALLOWED, message: 'hello' });
 
-  const res = await post(proxy, { to: ALLOWED, message: 'hello' });
-
-  assert.equal(res.status, 502);
-  assert.equal(res.body.success, false);
+  for (const res of [fiveHundred, fourHundred, nullBody]) {
+    assert.equal(res.status, 504, 'a 502 here is retry-inviting and the call may already be queued');
+    assert.equal(res.body.success, false);
+    assert.match(res.body.error, /status unknown/i);
+  }
 });
 
 test('C5: POST: voice-app unreachable (connection refused: nothing was sent) is a 502', async () => {
@@ -509,4 +515,73 @@ test('D9: the default window is on: with OUTBOUND_DEDUPE_WINDOW_MS unset an iden
 
   assert.equal(voiceApp.received.length, 1);
   assert.equal(second.status, 202);
+});
+
+test('D10: an unreadable non-2xx answer is remembered like any ambiguous outcome: the immediate retry does not dial again', async () => {
+  const dedupe = await spawnProxy({ OUTBOUND_ALLOWED_TO: ALLOWED, OUTBOUND_DEDUPE_WINDOW_MS: '120000' });
+  voiceApp.onPost = (req, res) => reply(res, 503, 'upstream unavailable', 'text/plain');
+  const first = await post(dedupe, { to: ALLOWED, message: 'maybe queued' });
+  voiceApp.onPost = (req, res) => reply(res, 200, { success: true, callId: 'call-4', status: 'queued' });
+
+  const retry = await post(dedupe, { to: ALLOWED, message: 'maybe queued' });
+
+  assert.equal(first.status, 504);
+  assert.equal(retry.status, 504);
+  assert.equal(voiceApp.received.length, 1);
+});
+
+test('D11: a full table never evicts a live entry: the oldest call is still de-duplicated, and a NEW distinct call is refused (503, nothing sent)', async () => {
+  const dedupe = await spawnProxy({
+    OUTBOUND_ALLOWED_TO: ALLOWED,
+    OUTBOUND_DEDUPE_WINDOW_MS: '120000',
+    OUTBOUND_DEDUPE_MAX_ENTRIES: '3'
+  });
+  voiceApp.onPost = (req, res) => reply(res, 200, { success: true, callId: `call-${voiceApp.received.length}`, status: 'queued' });
+
+  for (const m of ['m1', 'm2', 'm3']) {
+    assert.equal((await post(dedupe, { to: ALLOWED, message: m })).status, 200);
+  }
+  const overflow = await post(dedupe, { to: ALLOWED, message: 'm4' });
+  const oldestAgain = await post(dedupe, { to: ALLOWED, message: 'm1' });
+
+  assert.equal(overflow.status, 503, 'a full table must refuse a new distinct call rather than forget an old one');
+  assert.equal(overflow.body.success, false);
+  assert.equal(oldestAgain.status, 202, 'm1 must still be de-duplicated: evicting it would let a retry ring the phone twice');
+  assert.equal(voiceApp.received.length, 3, 'neither the overflow call nor the repeat of m1 may reach the voice-app');
+});
+
+test('D12: once entries expire the table frees up and a new call dials again', async () => {
+  const dedupe = await spawnProxy({
+    OUTBOUND_ALLOWED_TO: ALLOWED,
+    OUTBOUND_DEDUPE_WINDOW_MS: '250',
+    OUTBOUND_DEDUPE_MAX_ENTRIES: '1'
+  });
+
+  assert.equal((await post(dedupe, { to: ALLOWED, message: 'first' })).status, 200);
+  assert.equal((await post(dedupe, { to: ALLOWED, message: 'second' })).status, 503);
+  await sleep(400);
+  const after = await post(dedupe, { to: ALLOWED, message: 'second' });
+
+  assert.equal(after.status, 200, 'the cap is a bound on LIVE entries, not a permanent lock-out');
+  assert.equal(voiceApp.received.length, 2);
+});
+
+test('D13: an IN-FLIGHT call is never pruned, even when it has been running longer than the window', async () => {
+  const dedupe = await spawnProxy({
+    OUTBOUND_ALLOWED_TO: ALLOWED,
+    OUTBOUND_DEDUPE_WINDOW_MS: '200',
+    OUTBOUND_PI_TIMEOUT_MS: '5000'
+  });
+  voiceApp.onPost = (req, res) => setTimeout(
+    () => reply(res, 200, { success: true, callId: 'call-slow', status: 'queued' }), 900);
+
+  const slow = post(dedupe, { to: ALLOWED, message: 'slow one' });
+  await sleep(450); // older than the 200ms window, but still in flight
+  const duplicate = await post(dedupe, { to: ALLOWED, message: 'slow one' });
+  const original = await slow;
+
+  assert.equal(voiceApp.received.length, 1, 'the duplicate arrived mid-flight and must wait for the original, not dial');
+  assert.equal(original.status, 200);
+  assert.equal(duplicate.status, 202);
+  assert.equal(duplicate.body.callId, 'call-slow');
 });

@@ -524,6 +524,7 @@ app.post('/end-session', (req, res) => {
 //   OUTBOUND_LOG_PATH           audit log (JSONL)                (default ./logs/outbound-calls.jsonl)
 //   OUTBOUND_ALLOWED_TO         comma-separated E.164 allowlist  (default empty = refuse all calls)
 //   OUTBOUND_DEDUPE_WINDOW_MS   duplicate-call window, 0 = off   (default 120000)
+//   OUTBOUND_DEDUPE_MAX_ENTRIES live duplicate-guard entries     (default 500; full = 503, never evicts)
 //   OUTBOUND_PI_TIMEOUT_MS      POST timeout to the voice-app    (default 15000)
 
 /* global AbortSignal */
@@ -542,7 +543,9 @@ function envNonNegativeInt(name, fallback) {
 const OUTBOUND_PI_TIMEOUT_MS = envNonNegativeInt('OUTBOUND_PI_TIMEOUT_MS', 15000) || 15000;
 const OUTBOUND_GET_TIMEOUT_MS = 10000;
 const OUTBOUND_DEDUPE_WINDOW_MS = envNonNegativeInt('OUTBOUND_DEDUPE_WINDOW_MS', 120000);
-const OUTBOUND_DEDUPE_MAX_ENTRIES = 500;
+// Bound on LIVE (unexpired or in-flight) entries. A full table REFUSES a new distinct call (503,
+// nothing sent); it never evicts a live entry, because forgetting a call re-opens the duplicate window.
+const OUTBOUND_DEDUPE_MAX_ENTRIES = envNonNegativeInt('OUTBOUND_DEDUPE_MAX_ENTRIES', 500) || 500;
 
 // The allowlist is read once at startup: changing it is a deliberate restart, not a runtime
 // request. Entries that are not well-formed E.164 can never match a validated `to`, so they are
@@ -615,6 +618,8 @@ function failedBeforeSend(err) {
 // Duplicate-call guard. Key = sha256(to | message | normalised mode); value = the in-flight or
 // finished OUTCOME of the first attempt. Only outcomes that may have placed a call are kept
 // (success and "status unknown"): a definite failure never became a call, so the retry must dial.
+// An entry is only ever removed by EXPIRY of a SETTLED entry or by a definite failure; it is never
+// evicted to make room (see OUTBOUND_DEDUPE_MAX_ENTRIES) and never pruned while still in flight.
 const recentOutbound = new Map();
 
 function dedupeKey(to, message, mode) {
@@ -623,12 +628,17 @@ function dedupeKey(to, message, mode) {
 
 function pruneRecentOutbound(now) {
   for (const [key, entry] of recentOutbound) {
-    if (now - entry.at > OUTBOUND_DEDUPE_WINDOW_MS) recentOutbound.delete(key);
+    if (entry.settled && now - entry.at > OUTBOUND_DEDUPE_WINDOW_MS) recentOutbound.delete(key);
   }
-  // Hard cap: an unbounded Map keyed by caller-supplied text is its own problem.
-  while (recentOutbound.size >= OUTBOUND_DEDUPE_MAX_ENTRIES) {
-    recentOutbound.delete(recentOutbound.keys().next().value);
+}
+
+// Seconds until the first live entry expires (>= 1), for a Retry-After hint on a full table.
+function secondsUntilRoom(now) {
+  let soonest = OUTBOUND_DEDUPE_WINDOW_MS;
+  for (const entry of recentOutbound.values()) {
+    if (entry.settled) soonest = Math.min(soonest, Math.max(0, OUTBOUND_DEDUPE_WINDOW_MS - (now - entry.at)));
   }
+  return Math.max(1, Math.ceil(soonest / 1000));
 }
 
 /**
@@ -636,10 +646,10 @@ function pruneRecentOutbound(now) {
  * { status, body, remember, piStatus, piCallId, piError, outcome } so the handler cannot throw.
  *
  *   queued          200  the voice-app accepted the call            remember (a call exists)
- *   rejected        4xx/5xx the voice-app answered, not accepted    do not remember (no call)
+ *   rejected        4xx/5xx the voice-app gave a STRUCTURED non-acceptance  do not remember (no call)
  *   not_sent        502  the request never left this host           do not remember (no call)
  *   status_unknown  504  the request may have been delivered but we  remember (it may be ringing)
- *                        do not know the result
+ *                        do not know the result (timeout, reset, or ANY answer we cannot read)
  */
 async function dialVoiceApp(piPayload) {
   let piResponse;
@@ -680,23 +690,19 @@ async function dialVoiceApp(piPayload) {
   }
 
   if (parseError !== null || !isPlainObject(piResult)) {
+    // The response arrived, so the request reached the voice-app; an answer we cannot read does not
+    // prove no call was queued. That holds for a 2xx AND for a 4xx/5xx (a crash after enqueue, a
+    // gateway error page): report "status unknown" and let the duplicate guard remember it. A
+    // retry-inviting 502 here is how a phone rings twice.
     const why = parseError !== null ? `unparseable body (${parseError})` : 'body is not a JSON object';
-    if (piResponse.ok) {
-      // 2xx: the voice-app may well have queued the call. Do not invite a retry.
-      return {
-        status: 504,
-        body: {
-          success: false,
-          error: `status unknown: voice-app answered HTTP ${piResponse.status} but the ${why}; ` +
-            'do not retry blindly, check GET /outbound-calls',
-        },
-        remember: true, piStatus: piResponse.status, piCallId: null, piError: why, outcome: 'status_unknown',
-      };
-    }
     return {
-      status: 502,
-      body: { success: false, error: `voice-app rejected the request (HTTP ${piResponse.status}, ${why})` },
-      remember: false, piStatus: piResponse.status, piCallId: null, piError: why, outcome: 'rejected',
+      status: 504,
+      body: {
+        success: false,
+        error: `status unknown: voice-app answered HTTP ${piResponse.status} but the ${why}; ` +
+          'do not retry blindly, check GET /outbound-calls',
+      },
+      remember: true, piStatus: piResponse.status, piCallId: null, piError: why, outcome: 'status_unknown',
     };
   }
 
@@ -821,6 +827,29 @@ app.post('/outbound-call', async (req, res) => {
   if (key !== null) {
     pruneRecentOutbound(startTime);
     const prior = recentOutbound.get(key);
+    if (!prior && recentOutbound.size >= OUTBOUND_DEDUPE_MAX_ENTRIES) {
+      // Never evict a live entry to make room: refuse this NEW distinct call. Nothing was sent, so
+      // it is safe to retry once an entry expires.
+      const retryAfter = secondsUntilRoom(startTime);
+      console.warn(`[${timestamp}] OUTBOUND CALL REFUSED → ${to} duplicate-guard table full (${recentOutbound.size} live)`);
+      appendOutboundLog({
+        timestamp,
+        direction: 'outbound',
+        to,
+        blocked: 'dedupe_table_full',
+        triggered_by: typeof triggeredBy === 'string' ? triggeredBy.slice(0, 80) : null,
+        pi_status: null,
+        pi_call_id: null,
+        pi_error: null,
+        duration_ms: Date.now() - startTime,
+      });
+      res.set('Retry-After', String(retryAfter));
+      return res.status(503).json({
+        success: false,
+        error: 'Too many recent distinct outbound calls; nothing was sent',
+        retry_after_s: retryAfter,
+      });
+    }
     if (prior) {
       const first = await prior.outcome;
       const durationMs = Date.now() - startTime;
@@ -862,11 +891,12 @@ app.post('/outbound-call', async (req, res) => {
 
   // ── Proxy to Pi ───────────────────────────────────────────────────────
   const outcomePromise = dialVoiceApp(piPayload);
-  const entry = key !== null ? { at: startTime, outcome: outcomePromise } : null;
+  const entry = key !== null ? { at: startTime, settled: false, outcome: outcomePromise } : null;
   if (entry) recentOutbound.set(key, entry);
   const result = await outcomePromise;
-  if (entry && !result.remember && recentOutbound.get(key) === entry) {
-    recentOutbound.delete(key);
+  if (entry) {
+    entry.settled = true;
+    if (!result.remember && recentOutbound.get(key) === entry) recentOutbound.delete(key);
   }
 
   const durationMs = Date.now() - startTime;
