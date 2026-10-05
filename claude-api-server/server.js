@@ -620,6 +620,8 @@ function failedBeforeSend(err) {
 // (success and "status unknown"): a definite failure never became a call, so the retry must dial.
 // An entry is only ever removed by EXPIRY of a SETTLED entry or by a definite failure; it is never
 // evicted to make room (see OUTBOUND_DEDUPE_MAX_ENTRIES) and never pruned while still in flight.
+// The window is measured from the moment the first attempt SETTLED, not from when it started, so a
+// slow call (up to OUTBOUND_PI_TIMEOUT_MS) cannot eat the protection it is supposed to provide.
 const recentOutbound = new Map();
 
 function dedupeKey(to, message, mode) {
@@ -628,7 +630,7 @@ function dedupeKey(to, message, mode) {
 
 function pruneRecentOutbound(now) {
   for (const [key, entry] of recentOutbound) {
-    if (entry.settled && now - entry.at > OUTBOUND_DEDUPE_WINDOW_MS) recentOutbound.delete(key);
+    if (entry.settled && now - entry.settledAt > OUTBOUND_DEDUPE_WINDOW_MS) recentOutbound.delete(key);
   }
 }
 
@@ -636,7 +638,7 @@ function pruneRecentOutbound(now) {
 function secondsUntilRoom(now) {
   let soonest = OUTBOUND_DEDUPE_WINDOW_MS;
   for (const entry of recentOutbound.values()) {
-    if (entry.settled) soonest = Math.min(soonest, Math.max(0, OUTBOUND_DEDUPE_WINDOW_MS - (now - entry.at)));
+    if (entry.settled) soonest = Math.min(soonest, Math.max(0, OUTBOUND_DEDUPE_WINDOW_MS - (now - entry.settledAt)));
   }
   return Math.max(1, Math.ceil(soonest / 1000));
 }
@@ -922,11 +924,12 @@ app.post('/outbound-call', async (req, res) => {
 
   // ── Proxy to Pi ───────────────────────────────────────────────────────
   const outcomePromise = dialVoiceApp(piPayload);
-  const entry = key !== null ? { at: startTime, settled: false, outcome: outcomePromise } : null;
+  const entry = key !== null ? { at: startTime, settled: false, settledAt: null, outcome: outcomePromise } : null;
   if (entry) recentOutbound.set(key, entry);
   const result = await outcomePromise;
   if (entry) {
     entry.settled = true;
+    entry.settledAt = Date.now();
     if (!result.remember && recentOutbound.get(key) === entry) recentOutbound.delete(key);
   }
 

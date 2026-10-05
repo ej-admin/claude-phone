@@ -600,3 +600,38 @@ test('D13: an IN-FLIGHT call is never pruned, even when it has been running long
   assert.equal(duplicate.status, 202);
   assert.equal(duplicate.body.callId, 'call-slow');
 });
+
+test('D14: the window is anchored at SETTLE time: a call that took longer than the window is still de-duplicated right after it finishes', async () => {
+  const dedupe = await spawnProxy({
+    OUTBOUND_ALLOWED_TO: ALLOWED,
+    OUTBOUND_DEDUPE_WINDOW_MS: '300',
+    OUTBOUND_PI_TIMEOUT_MS: '5000'
+  });
+  voiceApp.onPost = (req, res) => setTimeout(
+    () => reply(res, 200, { success: true, callId: 'call-long', status: 'queued' }), 600);
+
+  const first = await post(dedupe, { to: ALLOWED, message: 'long dial' }); // settles ~600ms after it started: older than the window
+  const retry = await post(dedupe, { to: ALLOWED, message: 'long dial' }); // immediately after settle
+
+  assert.equal(first.status, 200);
+  assert.equal(retry.status, 202, 'expiry measured from the START of a long call would already have forgotten it');
+  assert.equal(voiceApp.received.length, 1);
+});
+
+test('D15: the table bound is atomic: 8 distinct calls fired at once against a cap of 3 dial exactly 3 and refuse 5 (503)', async () => {
+  const dedupe = await spawnProxy({
+    OUTBOUND_ALLOWED_TO: ALLOWED,
+    OUTBOUND_DEDUPE_WINDOW_MS: '120000',
+    OUTBOUND_DEDUPE_MAX_ENTRIES: '3',
+    OUTBOUND_PI_TIMEOUT_MS: '5000'
+  });
+  voiceApp.onPost = (req, res) => setTimeout(
+    () => reply(res, 200, { success: true, callId: 'call-x', status: 'queued' }), 200);
+
+  const results = await Promise.all(
+    Array.from({ length: 8 }, (_, i) => post(dedupe, { to: ALLOWED, message: `distinct ${i}` })));
+
+  const statuses = results.map((r) => r.status).sort();
+  assert.deepEqual(statuses, [200, 200, 200, 503, 503, 503, 503, 503], 'admission is check-then-set with no await in between, so concurrency cannot overshoot the cap');
+  assert.equal(voiceApp.received.length, 3);
+});
