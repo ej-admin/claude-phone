@@ -77,7 +77,12 @@ async function startProxy(voiceAppUrl) {
     env: Object.assign({}, process.env, {
       PORT: String(port),
       VOICE_APP_URL: voiceAppUrl,
-      OUTBOUND_LOG_PATH: path.join(logDir, 'outbound-calls.jsonl')
+      OUTBOUND_LOG_PATH: path.join(logDir, 'outbound-calls.jsonl'),
+      // HOME-10759: the proxy only dials allow-listed numbers (fail closed), and de-duplicates
+      // identical calls. These tests post the same number/payload repeatedly to observe the
+      // forwarded fields, so the allowlist admits it and the duplicate window is off.
+      OUTBOUND_ALLOWED_TO: '+15551234567',
+      OUTBOUND_DEDUPE_WINDOW_MS: '0'
     }),
     stdio: 'ignore'
   });

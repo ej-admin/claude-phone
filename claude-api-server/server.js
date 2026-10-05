@@ -17,6 +17,7 @@ const express = require('express');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const {
   buildQueryContext,
   buildStructuredPrompt,
@@ -503,11 +504,55 @@ app.post('/end-session', (req, res) => {
 //   POST http://ai-phone:3000/api/outbound-call
 //   { to, message, mode: 'announce'|'conversation', device, callerId,
 //     timeoutSeconds, webhookUrl }
+//
+// HARDENING (HOME-10759 / ADV-12713, desk "Option A-minimal" ruling on the two-voice review of
+// the original proxy). This server listens on 0.0.0.0:3333 with no authentication, so:
+//   1. OWNER ALLOWLIST. POST /outbound-call dials only numbers listed in OUTBOUND_ALLOWED_TO
+//      (comma-separated E.164, exact match). Unset or blank = FAIL CLOSED: every call is refused.
+//      A refused call is a 403 plus an audit line; it never reaches the voice-app.
+//   2. GET proxies never relay a voice-app non-2xx. A Pi 404 would otherwise make THIS server
+//      answer 404, indistinguishable from "this server has no such route" -- the fault that took
+//      the phone-escalation monitors red. Every non-2xx and every network error is a 502.
+//   3. A voice-app answer that is null / not JSON / not an object never throws (an unhandled
+//      rejection in an async Express 4 handler can kill the process).
+//   4. DUPLICATE-CALL GUARD. An ambiguous outcome (the request left, the answer did not come back
+//      intact) is a 504 "status unknown", never a retry-inviting 502, and an identical call
+//      (same to + message + normalised mode) inside OUTBOUND_DEDUPE_WINDOW_MS is not dialed again.
+//
+// Environment:
+//   VOICE_APP_URL               Pi voice-app base URL            (default http://ai-phone:3000)
+//   OUTBOUND_LOG_PATH           audit log (JSONL)                (default ./logs/outbound-calls.jsonl)
+//   OUTBOUND_ALLOWED_TO         comma-separated E.164 allowlist  (default empty = refuse all calls)
+//   OUTBOUND_DEDUPE_WINDOW_MS   duplicate-call window, 0 = off   (default 120000)
+//   OUTBOUND_PI_TIMEOUT_MS      POST timeout to the voice-app    (default 15000)
 
+/* global AbortSignal */
 const VOICE_APP_URL = process.env.VOICE_APP_URL || 'http://ai-phone:3000';
 const OUTBOUND_LOG_PATH =
   process.env.OUTBOUND_LOG_PATH ||
   path.join(__dirname, 'logs', 'outbound-calls.jsonl');
+
+function envNonNegativeInt(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+const OUTBOUND_PI_TIMEOUT_MS = envNonNegativeInt('OUTBOUND_PI_TIMEOUT_MS', 15000) || 15000;
+const OUTBOUND_GET_TIMEOUT_MS = 10000;
+const OUTBOUND_DEDUPE_WINDOW_MS = envNonNegativeInt('OUTBOUND_DEDUPE_WINDOW_MS', 120000);
+const OUTBOUND_DEDUPE_MAX_ENTRIES = 500;
+
+// The allowlist is read once at startup: changing it is a deliberate restart, not a runtime
+// request. Entries that are not well-formed E.164 can never match a validated `to`, so they are
+// dropped (and counted in the startup warning below) rather than silently kept.
+const OUTBOUND_ALLOWED_TO_RAW = String(process.env.OUTBOUND_ALLOWED_TO || '')
+  .split(',')
+  .map((entry) => entry.trim())
+  .filter(Boolean);
+// (isValidE164 is a function declaration below, so it is hoisted and safe to call here.)
+const OUTBOUND_ALLOWED_TO = new Set(OUTBOUND_ALLOWED_TO_RAW.filter(isValidE164));
 
 // Mode aliasing: HOME-972 task spec uses 'tts' / 'interactive', Pi voice-app
 // uses 'announce' / 'conversation'. Accept both for ergonomics.
@@ -526,6 +571,10 @@ function isValidE164(s) {
   return typeof s === 'string' && /^\+[1-9]\d{7,14}$/.test(s);
 }
 
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
 function appendOutboundLog(entry) {
   try {
     if (!fs.existsSync(path.dirname(OUTBOUND_LOG_PATH))) {
@@ -537,6 +586,142 @@ function appendOutboundLog(entry) {
   }
 }
 
+// Codes that prove the request never left this host (nothing was sent, so nothing can be ringing).
+// ECONNRESET, aborts, timeouts and anything unrecognised are deliberately NOT here: after the
+// request has been written, "I do not know" must be reported as "I do not know".
+const NOT_SENT_ERROR_CODES = new Set([
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'ERR_INVALID_URL',
+]);
+
+function collectErrorCodes(err, out = [], depth = 0) {
+  if (!err || depth > 4) return out;
+  if (err.code) out.push(err.code);
+  if (Array.isArray(err.errors)) err.errors.forEach((e) => collectErrorCodes(e, out, depth + 1));
+  if (err.cause) collectErrorCodes(err.cause, out, depth + 1);
+  return out;
+}
+
+function failedBeforeSend(err) {
+  const codes = collectErrorCodes(err);
+  return codes.length > 0 && codes.every((c) => NOT_SENT_ERROR_CODES.has(c));
+}
+
+// Duplicate-call guard. Key = sha256(to | message | normalised mode); value = the in-flight or
+// finished OUTCOME of the first attempt. Only outcomes that may have placed a call are kept
+// (success and "status unknown"): a definite failure never became a call, so the retry must dial.
+const recentOutbound = new Map();
+
+function dedupeKey(to, message, mode) {
+  return crypto.createHash('sha256').update(`${to}\n${message}\n${mode}`).digest('hex');
+}
+
+function pruneRecentOutbound(now) {
+  for (const [key, entry] of recentOutbound) {
+    if (now - entry.at > OUTBOUND_DEDUPE_WINDOW_MS) recentOutbound.delete(key);
+  }
+  // Hard cap: an unbounded Map keyed by caller-supplied text is its own problem.
+  while (recentOutbound.size >= OUTBOUND_DEDUPE_MAX_ENTRIES) {
+    recentOutbound.delete(recentOutbound.keys().next().value);
+  }
+}
+
+/**
+ * Send one call to the voice-app and classify the result. NEVER rejects: every path returns
+ * { status, body, remember, piStatus, piCallId, piError, outcome } so the handler cannot throw.
+ *
+ *   queued          200  the voice-app accepted the call            remember (a call exists)
+ *   rejected        4xx/5xx the voice-app answered, not accepted    do not remember (no call)
+ *   not_sent        502  the request never left this host           do not remember (no call)
+ *   status_unknown  504  the request may have been delivered but we  remember (it may be ringing)
+ *                        do not know the result
+ */
+async function dialVoiceApp(piPayload) {
+  let piResponse;
+  try {
+    piResponse = await fetch(`${VOICE_APP_URL}/api/outbound-call`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(piPayload),
+      // Default 15s: the Pi just enqueues; the call itself takes longer to ring.
+      signal: AbortSignal.timeout(OUTBOUND_PI_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const msg = err.message || String(err);
+    if (failedBeforeSend(err)) {
+      return {
+        status: 502,
+        body: { success: false, error: `voice-app proxy failed: ${msg}` },
+        remember: false, piStatus: null, piCallId: null, piError: msg, outcome: 'not_sent',
+      };
+    }
+    return {
+      status: 504,
+      body: {
+        success: false,
+        error: `status unknown: the request may have reached the voice-app but no answer came back (${msg}); ` +
+          'do not retry blindly, check GET /outbound-calls',
+      },
+      remember: true, piStatus: null, piCallId: null, piError: msg, outcome: 'status_unknown',
+    };
+  }
+
+  let piResult = null;
+  let parseError = null;
+  try {
+    piResult = await piResponse.json();
+  } catch (err) {
+    parseError = err.message || String(err);
+  }
+
+  if (parseError !== null || !isPlainObject(piResult)) {
+    const why = parseError !== null ? `unparseable body (${parseError})` : 'body is not a JSON object';
+    if (piResponse.ok) {
+      // 2xx: the voice-app may well have queued the call. Do not invite a retry.
+      return {
+        status: 504,
+        body: {
+          success: false,
+          error: `status unknown: voice-app answered HTTP ${piResponse.status} but the ${why}; ` +
+            'do not retry blindly, check GET /outbound-calls',
+        },
+        remember: true, piStatus: piResponse.status, piCallId: null, piError: why, outcome: 'status_unknown',
+      };
+    }
+    return {
+      status: 502,
+      body: { success: false, error: `voice-app rejected the request (HTTP ${piResponse.status}, ${why})` },
+      remember: false, piStatus: piResponse.status, piCallId: null, piError: why, outcome: 'rejected',
+    };
+  }
+
+  if (!piResponse.ok || !piResult.success) {
+    // The voice-app gave a structured answer that is not an acceptance: relay it as before.
+    return {
+      status: piResponse.status,
+      body: piResult,
+      remember: false, piStatus: piResponse.status, piCallId: piResult.callId || null,
+      piError: piResult.error || 'unknown', outcome: 'rejected',
+    };
+  }
+
+  return {
+    status: 200,
+    body: {
+      success: true,
+      callId: piResult.callId,
+      status: piResult.status,
+      message: piResult.message || 'Call initiated',
+    },
+    remember: true, piStatus: piResponse.status, piCallId: piResult.callId || null, piError: null, outcome: 'queued',
+  };
+}
+
 /**
  * POST /outbound-call
  *
@@ -544,7 +729,7 @@ function appendOutboundLog(entry) {
  *
  * Request body:
  *   {
- *     "to": "+19033002001",        // E.164, required
+ *     "to": "+19033002001",        // E.164, required, must be on OUTBOUND_ALLOWED_TO (else 403)
  *     "message": "...",             // text to speak, required, max 1000 chars
  *     "mode": "tts"|"interactive"   // optional, default 'tts' (announce)
  *                                    // also accepts 'announce'|'conversation'
@@ -558,8 +743,11 @@ function appendOutboundLog(entry) {
  *   }
  *
  * Response:
- *   { success: true, callId, status, message }
- *   or { success: false, error }
+ *   200 { success: true, callId, status, message }       call queued
+ *   202 { success: true, callId, ..., deduplicated: true } identical call inside the window; not dialed again
+ *   400 / 403 { success: false, error }                   malformed / destination not permitted
+ *   502 { success: false, error }                         nothing was sent; safe to retry
+ *   504 { success: false, error: 'status unknown ...' }   the call MAY be ringing; do not retry blindly
  */
 app.post('/outbound-call', async (req, res) => {
   const startTime = Date.now();
@@ -582,6 +770,29 @@ app.post('/outbound-call', async (req, res) => {
       .status(400)
       .json({ success: false, error: 'Invalid phone number — must be E.164 format (+15551234567)' });
   }
+
+  // ── Owner allowlist (before any other check: a refused number learns nothing) ──────────
+  if (!OUTBOUND_ALLOWED_TO.has(to)) {
+    const by = typeof triggeredBy === 'string' ? triggeredBy.slice(0, 80) : null;
+    console.warn(
+      `[${timestamp}] OUTBOUND CALL BLOCKED → ${to} not in OUTBOUND_ALLOWED_TO triggered_by=${by || 'unknown'}`
+    );
+    appendOutboundLog({
+      timestamp,
+      direction: 'outbound',
+      to,
+      blocked: 'to_not_in_allowlist',
+      triggered_by: by,
+      pi_status: null,
+      pi_call_id: null,
+      pi_error: null,
+      duration_ms: Date.now() - startTime,
+    });
+    return res
+      .status(403)
+      .json({ success: false, error: 'Destination not permitted' });
+  }
+
   if (!message || typeof message !== 'string') {
     return res.status(400).json({ success: false, error: 'message is required (string)' });
   }
@@ -624,103 +835,129 @@ app.post('/outbound-call', async (req, res) => {
   if (typeof triggeredBy === 'string' && triggeredBy) piPayload.triggeredBy = triggeredBy;
   if (typeof requireAck === 'boolean') piPayload.requireAck = requireAck;
 
+  // ── Duplicate-call guard ──────────────────────────────────────────────
+  const key = OUTBOUND_DEDUPE_WINDOW_MS > 0 ? dedupeKey(to, message, normalizedMode) : null;
+  if (key !== null) {
+    pruneRecentOutbound(startTime);
+    const prior = recentOutbound.get(key);
+    if (prior) {
+      const first = await prior.outcome;
+      const durationMs = Date.now() - startTime;
+      console.warn(
+        `[${timestamp}] OUTBOUND CALL DUPLICATE → ${to} not dialed again; first attempt outcome=${first.outcome}`
+      );
+      appendOutboundLog({
+        timestamp,
+        direction: 'outbound',
+        to,
+        mode: normalizedMode,
+        message_preview: message.slice(0, 80),
+        triggered_by: typeof triggeredBy === 'string' ? triggeredBy.slice(0, 80) : null,
+        deduplicated: true,
+        first_outcome: first.outcome,
+        pi_status: null,
+        pi_call_id: first.piCallId,
+        pi_error: null,
+        duration_ms: durationMs,
+      });
+      if (first.status === 200) {
+        return res.status(202).json({
+          success: true,
+          callId: first.body.callId,
+          status: first.body.status,
+          message: 'Duplicate of a call placed moments ago; not dialed again',
+          deduplicated: true,
+          duration_ms: durationMs,
+        });
+      }
+      return res.status(first.status).json(Object.assign({}, first.body, { deduplicated: true }));
+    }
+  }
+
   console.log(
     `[${timestamp}] OUTBOUND CALL → ${to} mode=${normalizedMode} ` +
       `triggered_by=${triggeredBy || 'unknown'} (msg: ${message.slice(0, 60)}…)`
   );
 
   // ── Proxy to Pi ───────────────────────────────────────────────────────
-  let piResponse;
-  let piResult;
-  let piError = null;
-  try {
-    piResponse = await fetch(`${VOICE_APP_URL}/api/outbound-call`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(piPayload),
-      // 15s — Pi just enqueues; the call itself takes longer to ring
-      signal: AbortSignal.timeout(15000),
-    });
-    piResult = await piResponse.json();
-  } catch (err) {
-    piError = err.message || String(err);
+  const outcomePromise = dialVoiceApp(piPayload);
+  const entry = key !== null ? { at: startTime, outcome: outcomePromise } : null;
+  if (entry) recentOutbound.set(key, entry);
+  const result = await outcomePromise;
+  if (entry && !result.remember && recentOutbound.get(key) === entry) {
+    recentOutbound.delete(key);
   }
 
   const durationMs = Date.now() - startTime;
-  const auditEntry = {
+  appendOutboundLog({
     timestamp,
     direction: 'outbound',
     to,
     mode: normalizedMode,
     message_preview: message.slice(0, 80),
     triggered_by: triggeredBy || null,
-    pi_status: piResponse ? piResponse.status : null,
-    pi_call_id: piResult ? piResult.callId : null,
-    pi_error: piError,
-    duration_ms: durationMs,
-  };
-  appendOutboundLog(auditEntry);
-
-  if (piError) {
-    console.error(
-      `[${timestamp}] OUTBOUND CALL FAILED → ${to}: ${piError} (${durationMs}ms)`
-    );
-    return res
-      .status(502)
-      .json({ success: false, error: `voice-app proxy failed: ${piError}` });
-  }
-
-  if (!piResponse.ok || !piResult.success) {
-    console.error(
-      `[${timestamp}] OUTBOUND CALL REJECTED → ${to}: ${piResult.error || 'unknown'} (${durationMs}ms)`
-    );
-    return res.status(piResponse.status).json(piResult);
-  }
-
-  console.log(
-    `[${timestamp}] OUTBOUND CALL QUEUED → ${to} callId=${piResult.callId} (${durationMs}ms)`
-  );
-  res.json({
-    success: true,
-    callId: piResult.callId,
-    status: piResult.status,
-    message: piResult.message || 'Call initiated',
+    pi_status: result.piStatus,
+    pi_call_id: result.piCallId,
+    pi_error: result.piError,
+    outcome: result.outcome,
     duration_ms: durationMs,
   });
+
+  if (result.outcome === 'queued') {
+    console.log(
+      `[${timestamp}] OUTBOUND CALL QUEUED → ${to} callId=${result.piCallId} (${durationMs}ms)`
+    );
+    return res.status(200).json(Object.assign({}, result.body, { duration_ms: durationMs }));
+  }
+  console.error(
+    `[${timestamp}] OUTBOUND CALL ${result.outcome.toUpperCase()} → ${to}: ${result.piError} (${durationMs}ms)`
+  );
+  return res.status(result.status).json(result.body);
 });
+
+/**
+ * Proxy a GET to the Pi voice-app. 2xx with a JSON object is relayed unchanged; EVERYTHING else
+ * (any non-2xx including 404, a network error, a null / non-object / non-JSON body) is a 502, so
+ * a 404 from this server can only ever mean "this server has no such route".
+ */
+async function proxyVoiceAppGet(res, piPath) {
+  try {
+    const r = await fetch(`${VOICE_APP_URL}${piPath}`, {
+      signal: AbortSignal.timeout(OUTBOUND_GET_TIMEOUT_MS),
+    });
+    if (!r.ok) {
+      if (r.body) r.body.cancel().catch(() => {});
+      return res.status(502).json({
+        success: false,
+        error: `voice-app proxy failed: voice-app answered HTTP ${r.status}`,
+        voice_app_status: r.status,
+      });
+    }
+    const result = await r.json();
+    if (!isPlainObject(result)) {
+      return res
+        .status(502)
+        .json({ success: false, error: 'voice-app proxy failed: voice-app body is not a JSON object' });
+    }
+    return res.status(r.status).json(result);
+  } catch (err) {
+    return res.status(502).json({ success: false, error: `voice-app proxy failed: ${err.message || String(err)}` });
+  }
+}
 
 /**
  * GET /outbound-call/:callId
  * Proxy to Pi for call status lookup.
  */
-app.get('/outbound-call/:callId', async (req, res) => {
-  const { callId } = req.params;
-  try {
-    const r = await fetch(`${VOICE_APP_URL}/api/call/${encodeURIComponent(callId)}`, {
-      signal: AbortSignal.timeout(10000),
-    });
-    const result = await r.json();
-    res.status(r.status).json(result);
-  } catch (err) {
-    res.status(502).json({ success: false, error: `voice-app proxy failed: ${err.message}` });
-  }
-});
+app.get('/outbound-call/:callId', (req, res) =>
+  proxyVoiceAppGet(res, `/api/call/${encodeURIComponent(req.params.callId)}`)
+);
 
 /**
  * GET /outbound-calls
  * Proxy to Pi for active call list.
  */
-app.get('/outbound-calls', async (req, res) => {
-  try {
-    const r = await fetch(`${VOICE_APP_URL}/api/calls`, {
-      signal: AbortSignal.timeout(10000),
-    });
-    const result = await r.json();
-    res.status(r.status).json(result);
-  } catch (err) {
-    res.status(502).json({ success: false, error: `voice-app proxy failed: ${err.message}` });
-  }
-});
+app.get('/outbound-calls', (req, res) => proxyVoiceAppGet(res, '/api/calls'));
 
 /**
  * GET /health
@@ -760,6 +997,14 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('='.repeat(64));
   console.log(`\nListening on: http://0.0.0.0:${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  // HOME-10759: log the COUNT only, never the numbers.
+  console.log(`Outbound-call allowlist: ${OUTBOUND_ALLOWED_TO.size} number(s); duplicate window ${OUTBOUND_DEDUPE_WINDOW_MS}ms`);
+  if (OUTBOUND_ALLOWED_TO.size === 0) {
+    console.warn('WARNING: OUTBOUND_ALLOWED_TO is unset/blank -> POST /outbound-call refuses EVERY call (fail closed)');
+  }
+  if (OUTBOUND_ALLOWED_TO_RAW.length !== OUTBOUND_ALLOWED_TO.size) {
+    console.warn(`WARNING: ${OUTBOUND_ALLOWED_TO_RAW.length - OUTBOUND_ALLOWED_TO.size} OUTBOUND_ALLOWED_TO entr(ies) are not well-formed E.164 and were ignored`);
+  }
   console.log('\nReady to receive Claude queries from voice interface.\n');
 });
 
