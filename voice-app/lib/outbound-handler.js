@@ -78,7 +78,15 @@ async function initiateOutboundCall(srf, mediaServer, options) {
       ? process.env.SIP_TRUNK_ACCESS_PREFIX
       : '9';
     const isExternal = to.startsWith('+');
-    const phoneNumber = isExternal ? trunkAccessPrefix + to.replace(/^\+1?/, '') : to;
+    // HOME-5417 (Jeff, ratification 105983): KEEP the country code. The prior
+    // pattern /^\+1?/ stripped BOTH the '+' and the '1', producing a dial string
+    // of trunk-prefix + BARE 10 DIGITS (98479223942). A 9-prefixed bare 10-digit
+    // number does not match a long-distance outbound rule on the 3CX cloud
+    // tenant, so the local SBC answered the call itself (200 OK from
+    // Contact <sip:98479223942@127.0.0.1:5060>) and no PSTN leg was ever placed
+    // -- the handset never rang. Required form is 9 + 1 + 10 digits.
+    // Strip ONLY the leading '+'.
+    const phoneNumber = isExternal ? trunkAccessPrefix + to.replace(/^\+/, '') : to;
     // HOME-5409: this deployment runs the "SBC-everywhere" model (see
     // src/features/sbc-simplified-installer/SPEC.md) -- voice-app registers
     // with a LOCAL 3CX SBC (SIP_REGISTRAR), which is the only thing that
