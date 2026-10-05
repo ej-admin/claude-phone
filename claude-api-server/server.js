@@ -745,7 +745,10 @@ async function dialVoiceApp(piPayload) {
  *     "callerId": "+15551234567",   // optional caller ID
  *     "timeoutSeconds": 30,         // optional ring timeout
  *     "webhookUrl": "...",          // optional status webhook
- *     "triggeredBy": "ralph"        // optional: who triggered (audit)
+ *     "triggeredBy": "ralph"        // optional string (400 if not a string; null = absent): who
+ *                                   // triggered (audit; also forwarded to the voice-app, where an
+ *                                   // allow-listed value implies requireAck)
+ *     "requireAck": true|false      // optional: ask the listener to press 1 (HOME-10660)
  *   }
  *
  * Response:
@@ -767,6 +770,7 @@ app.post('/outbound-call', async (req, res) => {
     timeoutSeconds,
     webhookUrl,
     triggeredBy,
+    requireAck,
   } = req.body || {};
 
   // ── Input validation ──────────────────────────────────────────────────
@@ -813,6 +817,24 @@ app.post('/outbound-call', async (req, res) => {
       .json({ success: false, error: `Invalid mode: ${mode} (use tts|interactive)` });
   }
 
+  // HOME-10660: requireAck is an explicit opt-in to the voice-app's "Press 1 to
+  // acknowledge" prompt. A non-boolean must be rejected, not dropped: a caller that
+  // asked for an acknowledgement would otherwise silently get a call without one.
+  if (requireAck !== undefined && typeof requireAck !== 'boolean') {
+    return res
+      .status(400)
+      .json({ success: false, error: 'requireAck must be a boolean' });
+  }
+  // HOME-10759 (desk ruling on the #5 review): triggeredBy is the escalation marker the
+  // voice-app keys its "press 1" prompt on. A non-string value used to be silently dropped,
+  // placing the call WITHOUT the marker; reject it for the same reason requireAck is rejected.
+  // null is treated as absent (a caller serialising an unset field as null meant nothing).
+  if (triggeredBy !== undefined && triggeredBy !== null && typeof triggeredBy !== 'string') {
+    return res
+      .status(400)
+      .json({ success: false, error: 'triggeredBy must be a string' });
+  }
+
   // ── Build Pi request ──────────────────────────────────────────────────
   const piPayload = {
     to,
@@ -823,6 +845,15 @@ app.post('/outbound-call', async (req, res) => {
   if (callerId) piPayload.callerId = callerId;
   if (typeof timeoutSeconds === 'number') piPayload.timeoutSeconds = timeoutSeconds;
   if (webhookUrl) piPayload.webhookUrl = webhookUrl;
+  // HOME-10660: the voice-app asks the listener to press 1 only for calls that opt in
+  // (requireAck:true, or a triggeredBy on its OUTBOUND_ACK_TRIGGERS allow-list, default
+  // telegram-drainer-escalation). triggeredBy used to be logged here and dropped, so the
+  // voice-app could not tell an escalation from any other call. false is forwarded too:
+  // it is a decision that overrides an allow-listed triggeredBy.
+  // Every string is forwarded (even ''): validation above accepts every string, so a silent drop
+  // here would reintroduce the very bug the 400 closes. null/undefined are absent and not sent.
+  if (typeof triggeredBy === 'string') piPayload.triggeredBy = triggeredBy;
+  if (typeof requireAck === 'boolean') piPayload.requireAck = requireAck;
 
   // ── Duplicate-call guard ──────────────────────────────────────────────
   const key = OUTBOUND_DEDUPE_WINDOW_MS > 0 ? dedupeKey(to, message, normalizedMode) : null;
