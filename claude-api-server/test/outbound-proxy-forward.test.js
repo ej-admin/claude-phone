@@ -186,6 +186,15 @@ test('a non-string triggeredBy is a 400 and never reaches the voice-app (do not 
   assert.equal(voiceApp.received.length, 0, 'no call may be placed on a malformed request');
 });
 
+test('an empty-string triggeredBy is forwarded as-is: a string is never silently dropped (round-2 review)', async () => {
+  voiceApp.received.length = 0;
+
+  const res = await postCall({ to: '+15551234567', message: 'x', triggeredBy: '' });
+
+  assert.equal(res.status, 200);
+  assert.equal(voiceApp.received[0].triggeredBy, '', 'validation accepts every string, so forwarding must too; the voice-app decides what an empty marker means');
+});
+
 test('a null triggeredBy is treated as absent (callers that send an unset field as null are not broken)', async () => {
   voiceApp.received.length = 0;
 

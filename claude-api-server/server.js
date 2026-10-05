@@ -848,7 +848,9 @@ app.post('/outbound-call', async (req, res) => {
   // telegram-drainer-escalation). triggeredBy used to be logged here and dropped, so the
   // voice-app could not tell an escalation from any other call. false is forwarded too:
   // it is a decision that overrides an allow-listed triggeredBy.
-  if (typeof triggeredBy === 'string' && triggeredBy) piPayload.triggeredBy = triggeredBy;
+  // Every string is forwarded (even ''): validation above accepts every string, so a silent drop
+  // here would reintroduce the very bug the 400 closes. null/undefined are absent and not sent.
+  if (typeof triggeredBy === 'string') piPayload.triggeredBy = triggeredBy;
   if (typeof requireAck === 'boolean') piPayload.requireAck = requireAck;
 
   // ── Duplicate-call guard ──────────────────────────────────────────────
