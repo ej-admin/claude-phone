@@ -929,7 +929,8 @@ app.post('/outbound-call', async (req, res) => {
 /**
  * Proxy a GET to the Pi voice-app. 2xx with a JSON object is relayed unchanged; EVERYTHING else
  * (any non-2xx including 404, a network error, a null / non-object / non-JSON body) is a 502, so
- * a 404 from this server can only ever mean "this server has no such route".
+ * a 404 from this server can only ever mean "this server has no such route". A relayed 2xx is always
+ * answered 200 (a Pi 201/203/206 is not passed through): the contract is 200 or 502, nothing else.
  */
 async function proxyVoiceAppGet(res, piPath) {
   try {
@@ -950,7 +951,8 @@ async function proxyVoiceAppGet(res, piPath) {
         .status(502)
         .json({ success: false, error: 'voice-app proxy failed: voice-app body is not a JSON object' });
     }
-    return res.status(r.status).json(result);
+    // Always 200: the contract is "200 or 502, never anything else", so a Pi 201/203/206 is not relayed as such.
+    return res.status(200).json(result);
   } catch (err) {
     return res.status(502).json({ success: false, error: `voice-app proxy failed: ${err.message || String(err)}` });
   }

@@ -300,6 +300,21 @@ test('B4: GET /outbound-calls: a 2xx with a null / non-object body is a 502', as
   assert.equal(asText.status, 502);
 });
 
+test('B7: GET proxies answer 200 or 502 and nothing else: a Pi 201 / 203 / 206 with a JSON object is relayed as 200 (round-3 review)', async () => {
+  const payload = { success: true, data: [{ callId: 'c1' }] };
+  const seen = [];
+  for (const piStatus of [201, 203, 206]) {
+    voiceApp.onGet = (req, res) => reply(res, piStatus, payload);
+    const list = await get(proxy, '/outbound-calls');
+    const one = await get(proxy, '/outbound-call/c1');
+    seen.push([piStatus, list.status, one.status]);
+    assert.deepEqual(list.body, payload, 'the body is still relayed unchanged');
+  }
+
+  assert.deepEqual(seen, [[201, 200, 200], [203, 200, 200], [206, 200, 200]],
+    'the contract is "200 or 502, never anything else"; a relayed 2xx variant is neither');
+});
+
 test('B5: GET /outbound-calls: voice-app unreachable is a 502', async () => {
   const deadPort = await freePort();
   const orphan = await startProxy(`http://127.0.0.1:${deadPort}`, { OUTBOUND_ALLOWED_TO: ALLOWED });
