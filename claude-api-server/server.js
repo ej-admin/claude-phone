@@ -737,8 +737,9 @@ async function dialVoiceApp(piPayload) {
  *     "callerId": "+15551234567",   // optional caller ID
  *     "timeoutSeconds": 30,         // optional ring timeout
  *     "webhookUrl": "...",          // optional status webhook
- *     "triggeredBy": "ralph"        // optional: who triggered (audit; also forwarded to the
- *                                   // voice-app, where an allow-listed value implies requireAck)
+ *     "triggeredBy": "ralph"        // optional string (400 if not a string; null = absent): who
+ *                                   // triggered (audit; also forwarded to the voice-app, where an
+ *                                   // allow-listed value implies requireAck)
  *     "requireAck": true|false      // optional: ask the listener to press 1 (HOME-10660)
  *   }
  *
@@ -815,6 +816,15 @@ app.post('/outbound-call', async (req, res) => {
     return res
       .status(400)
       .json({ success: false, error: 'requireAck must be a boolean' });
+  }
+  // HOME-10759 (desk ruling on the #5 review): triggeredBy is the escalation marker the
+  // voice-app keys its "press 1" prompt on. A non-string value used to be silently dropped,
+  // placing the call WITHOUT the marker; reject it for the same reason requireAck is rejected.
+  // null is treated as absent (a caller serialising an unset field as null meant nothing).
+  if (triggeredBy !== undefined && triggeredBy !== null && typeof triggeredBy !== 'string') {
+    return res
+      .status(400)
+      .json({ success: false, error: 'triggeredBy must be a string' });
   }
 
   // ── Build Pi request ──────────────────────────────────────────────────

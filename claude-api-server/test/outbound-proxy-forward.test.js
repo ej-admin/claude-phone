@@ -171,13 +171,28 @@ test('a call with neither field sends neither (existing callers see no change)',
   assert.equal('triggeredBy' in voiceApp.received[0], false, 'no triggeredBy key invented');
 });
 
-test('a non-string triggeredBy is ignored rather than rejected (it was always tolerated)', async () => {
+test('a non-string triggeredBy is a 400 and never reaches the voice-app (do not silently drop an escalation marker)', async () => {
   voiceApp.received.length = 0;
 
-  const res = await postCall({ to: '+15551234567', message: 'x', triggeredBy: { who: 'someone' } });
+  // An object, a number and an array: each is a caller that meant to say who triggered the call.
+  // Dropping it would silently place the call WITHOUT the escalation marker the voice-app keys its
+  // "press 1" prompt on, so the caller must be told its request is malformed (desk ruling, HOME-10759).
+  for (const bad of [{ who: 'someone' }, 42, ['ralph'], true]) {
+    const res = await postCall({ to: '+15551234567', message: 'x', triggeredBy: bad });
 
-  assert.equal(res.status, 200, 'must not start rejecting callers that sent an odd triggeredBy before');
-  assert.equal('triggeredBy' in voiceApp.received[0], false, 'a non-string must not be forwarded');
+    assert.equal(res.status, 400, `triggeredBy ${JSON.stringify(bad)} must be rejected`);
+    assert.match(res.body.error, /triggeredBy/, 'the error must name the field');
+  }
+  assert.equal(voiceApp.received.length, 0, 'no call may be placed on a malformed request');
+});
+
+test('a null triggeredBy is treated as absent (callers that send an unset field as null are not broken)', async () => {
+  voiceApp.received.length = 0;
+
+  const res = await postCall({ to: '+15551234567', message: 'x', triggeredBy: null });
+
+  assert.equal(res.status, 200);
+  assert.equal('triggeredBy' in voiceApp.received[0], false, 'null is not forwarded');
 });
 
 test('a non-boolean requireAck is a 400 and never reaches the voice-app (do not silently drop an opt-in)', async () => {
