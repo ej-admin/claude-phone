@@ -129,6 +129,34 @@ function isTailnetAddress(ip) {
   return first === 100 && second >= 64 && second <= 127;
 }
 
+const IFACE_PREFIX = 'iface:';
+
+function isIPv4Entry(entry) {
+  return Boolean(entry) && (entry.family === 'IPv4' || entry.family === 4);
+}
+
+/**
+ * The CURRENT IPv4 addresses of a named interface. This exists because some hosts hand an interface an
+ * address that changes across restarts (for example WSL2 in NAT mode, whose port forward is refreshed to
+ * follow it): a literal in CLAUDE_API_LISTEN goes stale and the server then fails to bind and crash-loops.
+ * A missing interface or one without an IPv4 address throws and names what does exist.
+ */
+function addressesOfInterface(name, interfaces) {
+  if (name === '') {
+    throw new Error(`CLAUDE_API_LISTEN entry "${IFACE_PREFIX}" has no interface name (use e.g. ${IFACE_PREFIX}eth0)`);
+  }
+  const entries = interfaces && interfaces[name];
+  if (!entries) {
+    const available = Object.keys(interfaces || {}).sort().join(', ') || '(none)';
+    throw new Error(`CLAUDE_API_LISTEN entry "${IFACE_PREFIX}${name}": no interface named "${name}" on this host (interfaces: ${available})`);
+  }
+  const v4 = entries.filter(isIPv4Entry).map((entry) => entry.address);
+  if (v4.length === 0) {
+    throw new Error(`CLAUDE_API_LISTEN entry "${IFACE_PREFIX}${name}": interface "${name}" has no IPv4 address`);
+  }
+  return v4;
+}
+
 function isWildcard(address) {
   if (address === '0.0.0.0') return true;
   // '::', '::0', '0:0:0:0:0:0:0:0' ... any IPv6 literal made only of zeros and colons.
@@ -139,7 +167,8 @@ function isWildcard(address) {
  * Decide which addresses to bind.
  *
  *   CLAUDE_API_LISTEN unset/blank -> 127.0.0.1 plus any Tailscale IPv4 address found on a local interface.
- *   CLAUDE_API_LISTEN=a,b,c       -> exactly those IP literals (host names and ports are rejected).
+ *   CLAUDE_API_LISTEN=a,b,c       -> exactly those entries: IP literals, or iface:<name> for that interface's
+ *                                    current IPv4 addresses (host names and ports are rejected).
  *
  * A malformed entry THROWS rather than being dropped: a silently dropped address leaves some consumer
  * unable to connect with nothing in the log to say why. A wildcard is honoured only when written
@@ -147,7 +176,7 @@ function isWildcard(address) {
  *
  * NOTE: a host whose Tailscale interface is not visible to this process (for example WSL2 in NAT mode,
  * where Tailscale runs on the Windows side) gets loopback only by default; list the extra addresses
- * explicitly in CLAUDE_API_LISTEN.
+ * explicitly in CLAUDE_API_LISTEN (prefer iface:<name> for an address that can change).
  *
  * @returns {{addresses: string[], warnings: string[]}}
  */
@@ -159,8 +188,7 @@ function resolveListenAddresses(env, interfaces = os.networkInterfaces()) {
     const addresses = [DEFAULT_LOOPBACK];
     for (const entries of Object.values(interfaces || {})) {
       for (const entry of entries || []) {
-        const isV4 = entry && (entry.family === 'IPv4' || entry.family === 4);
-        if (isV4 && !entry.internal && isTailnetAddress(entry.address) && !addresses.includes(entry.address)) {
+        if (isIPv4Entry(entry) && !entry.internal && isTailnetAddress(entry.address) && !addresses.includes(entry.address)) {
           addresses.push(entry.address);
         }
       }
@@ -172,10 +200,16 @@ function resolveListenAddresses(env, interfaces = os.networkInterfaces()) {
   for (const part of raw.split(',')) {
     const entry = part.trim();
     if (entry === '') continue;
+    if (entry.startsWith(IFACE_PREFIX)) {
+      for (const address of addressesOfInterface(entry.slice(IFACE_PREFIX.length).trim(), interfaces)) {
+        if (!addresses.includes(address)) addresses.push(address);
+      }
+      continue;
+    }
     if (!net.isIP(entry)) {
       throw new Error(
         `CLAUDE_API_LISTEN entry "${entry}" is not an IP address literal ` +
-          '(use e.g. 127.0.0.1 or ::1; host names, interface names and ports are not accepted)'
+          '(use e.g. 127.0.0.1, ::1 or iface:eth0; host names and ports are not accepted)'
       );
     }
     if (!addresses.includes(entry)) addresses.push(entry);

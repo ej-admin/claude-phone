@@ -20,8 +20,10 @@
  *                           refuses to start; there is no unauthenticated mode.
  *   CLAUDE_API_ASK_ENABLED  /ask and /ask-structured run `claude --dangerously-skip-permissions`; they
  *                           answer 403 unless this is an explicit yes (1/true/yes/on). Default: off.
- *   CLAUDE_API_LISTEN       comma-separated IP literals to bind. Default: 127.0.0.1 plus any Tailscale
- *                           address on a local interface. Never 0.0.0.0 unless written here explicitly.
+ *   CLAUDE_API_LISTEN       comma-separated entries to bind: IP literals, or iface:<name> for that interface's
+ *                           current IPv4 addresses (use it for an address that can change across restarts).
+ *                           Default: 127.0.0.1 plus any Tailscale address on a local interface. Never 0.0.0.0
+ *                           unless written here explicitly.
  */
 
 const express = require('express');

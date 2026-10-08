@@ -218,8 +218,8 @@ npm run lint:fix      # Auto-fix issues
 to equal `CLAUDE_API_KEY` (constant-time compare, `401` otherwise). The server refuses to start without
 a key of at least 32 characters. `/ask` and `/ask-structured` spawn `claude --dangerously-skip-permissions`
 and answer `403` unless `CLAUDE_API_ASK_ENABLED` is an explicit yes. The server binds `CLAUDE_API_LISTEN`
-(default `127.0.0.1` plus any Tailscale address on a local interface), never `0.0.0.0` unless written
-there. Callers (the voice-app, watchdog, telephony, ralph) send the key from their own `CLAUDE_API_KEY`.
+(IP literals or `iface:<name>`; default `127.0.0.1` plus any Tailscale address on a local interface),
+never `0.0.0.0` unless written there. Callers (the voice-app, watchdog, telephony, ralph) send the key from their own `CLAUDE_API_KEY`.
 
 ## Key Design Decisions
 
@@ -241,7 +241,7 @@ See `.env.example` for all variables. Key ones:
 | `CLAUDE_API_URL` | URL to claude-api-server |
 | `CLAUDE_API_KEY` | Shared secret sent as `X-Claude-Api-Key` (server: required, min 32 chars) |
 | `CLAUDE_API_ASK_ENABLED` | Server only: enable `/ask` + `/ask-structured` (default off) |
-| `CLAUDE_API_LISTEN` | Server only: comma-separated IPs to bind (default loopback + tailnet) |
+| `CLAUDE_API_LISTEN` | Server only: comma-separated IPs or `iface:<name>` to bind (default loopback + tailnet) |
 | `ELEVENLABS_API_KEY` | TTS API key |
 | `OPENAI_API_KEY` | Whisper STT API key |
 | `SIP_DOMAIN` | 3CX server FQDN |
