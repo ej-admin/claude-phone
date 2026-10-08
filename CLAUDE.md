@@ -208,10 +208,18 @@ npm run lint:fix      # Auto-fix issues
 
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
-| POST | `/ask` | Send prompt to Claude |
-| POST | `/ask-structured` | Send prompt, return JSON |
+| POST | `/ask` | Send prompt to Claude (disabled unless `CLAUDE_API_ASK_ENABLED`) |
+| POST | `/ask-structured` | Send prompt, return JSON (disabled unless `CLAUDE_API_ASK_ENABLED`) |
 | POST | `/end-session` | Clean up session |
-| GET | `/health` | Health check |
+| POST | `/outbound-call`, GET `/outbound-call/:callId`, GET `/outbound-calls` | Outbound call proxy |
+| GET | `/health` | Health check (the only route that needs no key) |
+
+**Authentication (GEN-10898):** every route except `GET /health` requires the `X-Claude-Api-Key` header
+to equal `CLAUDE_API_KEY` (constant-time compare, `401` otherwise). The server refuses to start without
+a key of at least 32 characters. `/ask` and `/ask-structured` spawn `claude --dangerously-skip-permissions`
+and answer `403` unless `CLAUDE_API_ASK_ENABLED` is an explicit yes. The server binds `CLAUDE_API_LISTEN`
+(default `127.0.0.1` plus any Tailscale address on a local interface), never `0.0.0.0` unless written
+there. Callers (the voice-app, watchdog, telephony, ralph) send the key from their own `CLAUDE_API_KEY`.
 
 ## Key Design Decisions
 
@@ -231,6 +239,9 @@ See `.env.example` for all variables. Key ones:
 |----------|---------|
 | `EXTERNAL_IP` | Server LAN IP for RTP routing |
 | `CLAUDE_API_URL` | URL to claude-api-server |
+| `CLAUDE_API_KEY` | Shared secret sent as `X-Claude-Api-Key` (server: required, min 32 chars) |
+| `CLAUDE_API_ASK_ENABLED` | Server only: enable `/ask` + `/ask-structured` (default off) |
+| `CLAUDE_API_LISTEN` | Server only: comma-separated IPs to bind (default loopback + tailnet) |
 | `ELEVENLABS_API_KEY` | TTS API key |
 | `OPENAI_API_KEY` | Whisper STT API key |
 | `SIP_DOMAIN` | 3CX server FQDN |
