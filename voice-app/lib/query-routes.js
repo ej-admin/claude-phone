@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const router = express.Router();
 const logger = require('./logger');
 const deviceRegistry = require('./device-registry');
+const { authHeaders } = require('./claude-api-auth');
 
 // Dependencies injected via setupRoutes()
 let claudeBridge = null;
@@ -279,7 +280,8 @@ router.post('/query', async (req, res) => {
         },
         {
           timeout: timeout * 1000,
-          headers: { 'Content-Type': 'application/json' }
+          // GEN-10898: claude-api-server requires the API key on every route except GET /health
+          headers: { 'Content-Type': 'application/json', ...authHeaders() }
         }
       );
 

@@ -8,9 +8,22 @@
  *   node server.js
  *
  * Endpoints:
- *   POST /ask - Send a prompt to Claude (with optional callId for session)
+ *   POST /ask - Send a prompt to Claude (with optional callId for session) [disabled unless CLAUDE_API_ASK_ENABLED]
+ *   POST /ask-structured - Like /ask, validated JSON out [disabled unless CLAUDE_API_ASK_ENABLED]
  *   POST /end-session - Clean up session for a call
- *   GET /health - Health check
+ *   POST /outbound-call, GET /outbound-call/:callId, GET /outbound-calls - outbound call proxy
+ *   GET /health - Health check (the ONLY route that does not require authentication)
+ *
+ * Security (GEN-10898, see security.js):
+ *   CLAUDE_API_KEY          required. Every route except GET /health needs the X-Claude-Api-Key header to
+ *                           match it (401 otherwise). Missing or shorter than 32 characters = the server
+ *                           refuses to start; there is no unauthenticated mode.
+ *   CLAUDE_API_ASK_ENABLED  /ask and /ask-structured run `claude --dangerously-skip-permissions`; they
+ *                           answer 403 unless this is an explicit yes (1/true/yes/on). Default: off.
+ *   CLAUDE_API_LISTEN       comma-separated entries to bind: IP literals, or iface:<name> for that interface's
+ *                           current IPv4 addresses (use it for an address that can change across restarts).
+ *                           Default: 127.0.0.1 plus any Tailscale address on a local interface. Never 0.0.0.0
+ *                           unless written here explicitly.
  */
 
 const express = require('express');
@@ -25,9 +38,33 @@ const {
   validateRequiredFields,
   buildRepairPrompt,
 } = require('./structured');
+const security = require('./security');
 
 const app = express();
 const PORT = process.env.PORT || 3333;
+
+/**
+ * Report a startup failure and exit non-zero. fs.writeSync, not console.error: stderr on a pipe can be
+ * asynchronous, and process.exit() would drop the explanation the operator needs.
+ */
+function fatal(message) {
+  fs.writeSync(2, `[STARTUP] FATAL: ${message}\n`);
+  process.exit(1);
+}
+
+// GEN-10898: decide the security posture BEFORE anything else starts. A server that cannot enforce
+// authentication must not come up at all, so a misconfigured deploy is loud (exit 1, systemd shows it)
+// instead of a process that looks healthy while serving the open port the triage found.
+const apiKeyResult = security.loadApiKey(process.env);
+if (!apiKeyResult.ok) fatal(apiKeyResult.error);
+const API_KEY = apiKeyResult.key;
+const ASK_ENABLED = security.parseEnabledFlag(process.env.CLAUDE_API_ASK_ENABLED);
+let LISTEN;
+try {
+  LISTEN = security.resolveListenAddresses(process.env);
+} catch (err) {
+  fatal(err.message);
+}
 
 /**
  * Build the full environment that Claude Code expects
@@ -99,6 +136,10 @@ function buildClaudeEnvironment() {
   // CRITICAL: Remove ANTHROPIC_API_KEY so Claude CLI uses subscription auth
   // If ANTHROPIC_API_KEY is set (even to placeholder), CLI tries API auth instead
   delete env.ANTHROPIC_API_KEY;
+
+  // GEN-10898: the shared secret authenticates callers TO this server. The Claude CLI child runs with
+  // --dangerously-skip-permissions and can read its own environment, so it must never inherit the key.
+  delete env.CLAUDE_API_KEY;
 
   return env;
 }
@@ -225,15 +266,30 @@ Example response:
 
 `;
 
-// Middleware
-app.use(express.json());
-
-// Request logging
+// Request logging (method + path only: never headers, query strings or bodies, which can carry secrets)
 app.use((req, res, next) => {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] ${req.method} ${req.path}`);
   next();
 });
+
+// GEN-10898: authentication for EVERY route except GET /health. It sits before the body parser (an
+// unauthenticated caller never reaches the JSON parser) and before the routes (a path that does not
+// exist is also a 401, so a probe learns nothing about what this server serves).
+app.use(security.createAuthMiddleware({
+  key: API_KEY,
+  onDenied: ({ method, path: deniedPath, remoteAddress }) => {
+    // The presented credential is never logged. JSON.stringify keeps a hostile path on one log line.
+    console.warn(`[${new Date().toISOString()}] AUTH DENIED ${method} ${JSON.stringify(deniedPath)} from ${remoteAddress || 'unknown'}`);
+  },
+}));
+
+app.use(express.json());
+
+// GEN-10898: /ask and /ask-structured spawn the Claude CLI with --dangerously-skip-permissions. They are
+// opt-in even for an authenticated caller. Mounted per route (not globally) so /end-session, which the
+// voice-app calls when a call ends, is not affected.
+const askGate = security.createAskGate({ enabled: ASK_ENABLED });
 
 /**
  * POST /ask
@@ -257,7 +313,7 @@ app.use((req, res, next) => {
  *   - If devicePrompt is provided, it's prepended before VOICE_CONTEXT
  *   - This allows each device (NAS, Proxmox, etc.) to have its own identity and skills
  */
-app.post('/ask', async (req, res) => {
+app.post('/ask', askGate, async (req, res) => {
   const { prompt, callId, devicePrompt } = req.body;
   const startTime = Date.now();
   const timestamp = new Date().toISOString();
@@ -350,7 +406,7 @@ app.post('/ask', async (req, res) => {
  * Response (success):
  *   { "success": true, "data": {...}, "raw_response": "...", "duration_ms": 1234 }
  */
-app.post('/ask-structured', async (req, res) => {
+app.post('/ask-structured', askGate, async (req, res) => {
   const {
     prompt,
     callId,
@@ -1037,13 +1093,19 @@ app.get('/', (req, res) => {
   });
 });
 
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
+// Start server (GEN-10898: only the addresses in LISTEN, all-or-nothing; the old code bound 0.0.0.0)
+security.listenOnAll(app, LISTEN.addresses, PORT).then(() => {
   console.log('='.repeat(64));
   console.log('Claude HTTP API Server');
   console.log('='.repeat(64));
-  console.log(`\nListening on: http://0.0.0.0:${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log('');
+  for (const address of LISTEN.addresses) {
+    console.log(`Listening on: http://${security.formatHostPort(address, PORT)}`);
+  }
+  console.log(`Health check: http://${security.formatHostPort(LISTEN.addresses[0], PORT)}/health`);
+  console.log(`Authentication: required on every route except GET /health (header ${security.API_KEY_HEADER})`);
+  console.log(`/ask and /ask-structured: ${ASK_ENABLED ? 'ENABLED' : 'disabled'} (CLAUDE_API_ASK_ENABLED)`);
+  for (const warning of LISTEN.warnings) console.warn(warning);
   // HOME-10759: log the COUNT only, never the numbers.
   console.log(`Outbound-call allowlist: ${OUTBOUND_ALLOWED_TO.size} number(s); duplicate window ${OUTBOUND_DEDUPE_WINDOW_MS}ms`);
   if (OUTBOUND_ALLOWED_TO.size === 0) {
@@ -1053,7 +1115,7 @@ app.listen(PORT, '0.0.0.0', () => {
     console.warn(`WARNING: ${OUTBOUND_ALLOWED_TO_RAW.length - OUTBOUND_ALLOWED_TO.size} OUTBOUND_ALLOWED_TO entr(ies) are not well-formed E.164 and were ignored`);
   }
   console.log('\nReady to receive Claude queries from voice interface.\n');
-});
+}).catch((err) => fatal(err.message));
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
