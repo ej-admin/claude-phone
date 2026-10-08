@@ -84,8 +84,7 @@ let voiceApp;
 async function startFakeVoiceApp() {
   const fake = { requests: [] };
   fake.server = http.createServer((req, res) => {
-    let raw = '';
-    req.on('data', (chunk) => { raw += chunk; });
+    req.resume(); // the body is not needed; drain it so the connection can complete
     req.on('end', () => {
       fake.requests.push(`${req.method} ${req.url}`);
       res.setHeader('Content-Type', 'application/json');

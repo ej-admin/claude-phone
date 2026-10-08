@@ -30,6 +30,9 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const SERVER = path.join(__dirname, '..', 'server.js');
+// GEN-10898: the server refuses to start without CLAUDE_API_KEY and 401s every route but /health.
+// Built at runtime: a token-shaped literal in a test file trips the credential scanner.
+const API_KEY = 'proxy-test-' + require('node:crypto').randomBytes(24).toString('hex');
 
 const ALLOWED = '+15551234567';
 const ALLOWED_2 = '+15550001111';
@@ -105,6 +108,7 @@ async function startProxy(voiceAppUrl, env = {}) {
   const logPath = path.join(logDir, 'outbound-calls.jsonl');
   const childEnv = Object.assign({}, process.env, {
     PORT: String(port),
+    CLAUDE_API_KEY: API_KEY,
     VOICE_APP_URL: voiceAppUrl,
     OUTBOUND_LOG_PATH: logPath
   }, env);
@@ -143,7 +147,7 @@ async function startProxy(voiceAppUrl, env = {}) {
 async function post(proxy, body) {
   const res = await fetch(`${proxy.url}/outbound-call`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Claude-Api-Key': API_KEY },
     body: JSON.stringify(body)
   });
   const text = await res.text();
@@ -153,7 +157,7 @@ async function post(proxy, body) {
 }
 
 async function get(proxy, urlPath) {
-  const res = await fetch(`${proxy.url}${urlPath}`);
+  const res = await fetch(`${proxy.url}${urlPath}`, { headers: { 'X-Claude-Api-Key': API_KEY } });
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch { /* ignore */ }

@@ -13,8 +13,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const fs = require('node:fs');
-const path = require('node:path');
 
 const security = require('../security');
 
@@ -89,10 +87,22 @@ test('keysMatch: a very long or non-ASCII presented value does not throw (timing
   assert.equal(security.keysMatch('é'.repeat(100000), KEY), false);
 });
 
-test('keysMatch: the comparison is timingSafeEqual, not ===  (source guard against an "optimisation")', () => {
-  const source = fs.readFileSync(path.join(__dirname, '..', 'security.js'), 'utf8');
+test('keysMatch: the comparison goes through crypto.timingSafeEqual on equal-length digests, never ===', () => {
+  // Timing cannot be asserted in a unit test, so spy on the primitive instead: replacing the call with
+  // `presented === expected` (or an early return on length) is the tempting "simplification" to catch.
+  const original = crypto.timingSafeEqual;
+  const calls = [];
+  crypto.timingSafeEqual = (a, b) => { calls.push([a.length, b.length]); return original(a, b); };
+  let result;
+  try {
+    result = security.keysMatch(KEY, KEY + 'longer-than-the-key');
+  } finally {
+    crypto.timingSafeEqual = original;
+  }
 
-  assert.match(source, /timingSafeEqual/, 'the key comparison must use crypto.timingSafeEqual');
+  assert.equal(result, false);
+  assert.equal(calls.length, 1, 'the comparison must call crypto.timingSafeEqual exactly once, even for unequal input lengths');
+  assert.equal(calls[0][0], calls[0][1], 'both sides are hashed first, so the compared buffers always have equal length');
 });
 
 // ── isPublicRoute ────────────────────────────────────────────────────────────
