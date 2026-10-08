@@ -4,6 +4,7 @@
  */
 
 const axios = require('axios');
+const { authHeaders } = require('./claude-api-auth');
 
 const CLAUDE_API_URL = process.env.CLAUDE_API_URL || 'http://localhost:3333';
 
@@ -34,7 +35,8 @@ async function query(prompt, options = {}) {
       { prompt, callId, devicePrompt },
       {
         timeout: timeout * 1000,
-        headers: { 'Content-Type': 'application/json' }
+        // GEN-10898: claude-api-server requires the API key on every route except GET /health
+        headers: { 'Content-Type': 'application/json', ...authHeaders() }
       }
     );
 
@@ -82,7 +84,7 @@ async function endSession(callId) {
       { callId },
       { 
         timeout: 5000,
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 'Content-Type': 'application/json', ...authHeaders() }
       }
     );
     console.log(`[${timestamp}] CLAUDE Session ended: ${callId}`);
