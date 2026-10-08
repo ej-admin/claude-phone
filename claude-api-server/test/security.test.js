@@ -227,6 +227,57 @@ test('resolveListenAddresses: the default never produces a warning (nothing to w
   assert.deepEqual(warnings, []);
 });
 
+// ── resolveListenAddresses: iface:<name> (an address that changes must not be hard-coded) ──────────
+
+test('resolveListenAddresses: iface:<name> resolves to that interface\'s CURRENT IPv4 addresses (IPv6 ignored)', () => {
+  const { addresses } = security.resolveListenAddresses({ CLAUDE_API_LISTEN: 'iface:eth0' }, {
+    eth0: [iface('172.20.4.247'), iface('fe80::215:5dff:fefe:7735', { family: 'IPv6' })],
+  });
+
+  assert.deepEqual(addresses, ['172.20.4.247'], 'a NAT-style interface address can change on restart, so it is looked up, not typed');
+});
+
+test('resolveListenAddresses: iface:<name> mixes with literals, keeps order and drops duplicates', () => {
+  const { addresses } = security.resolveListenAddresses({ CLAUDE_API_LISTEN: '127.0.0.1, iface:eth0 ,172.20.4.247,iface:eth0' }, {
+    eth0: [iface('172.20.4.247')],
+  });
+
+  assert.deepEqual(addresses, ['127.0.0.1', '172.20.4.247']);
+});
+
+test('resolveListenAddresses: iface:<name> with several IPv4 addresses binds all of them', () => {
+  const { addresses } = security.resolveListenAddresses({ CLAUDE_API_LISTEN: 'iface:eth0' }, {
+    eth0: [iface('192.168.0.50'), iface('192.168.0.51')],
+  });
+
+  assert.deepEqual(addresses, ['192.168.0.50', '192.168.0.51']);
+});
+
+test('resolveListenAddresses: iface:<name> for an interface that is not there throws and lists the ones that are', () => {
+  assert.throws(
+    () => security.resolveListenAddresses({ CLAUDE_API_LISTEN: '127.0.0.1,iface:wlan9' }, { eth0: [iface('10.0.0.5')], lo: [iface('127.0.0.1', { internal: true })] }),
+    (err) => /CLAUDE_API_LISTEN/.test(err.message) && err.message.includes('wlan9') && err.message.includes('eth0') && err.message.includes('lo'),
+    'a missing interface must fail loudly (and name what exists), never silently bind fewer addresses'
+  );
+});
+
+test('resolveListenAddresses: iface:<name> for an interface with no IPv4 address throws', () => {
+  assert.throws(
+    () => security.resolveListenAddresses({ CLAUDE_API_LISTEN: 'iface:eth0' }, { eth0: [iface('fe80::1', { family: 'IPv6' })] }),
+    (err) => /CLAUDE_API_LISTEN/.test(err.message) && err.message.includes('eth0') && /IPv4/.test(err.message)
+  );
+});
+
+test('resolveListenAddresses: an empty iface: name throws', () => {
+  for (const entry of ['iface:', 'iface:   ']) {
+    assert.throws(
+      () => security.resolveListenAddresses({ CLAUDE_API_LISTEN: entry }, {}),
+      (err) => /CLAUDE_API_LISTEN/.test(err.message) && /interface name/i.test(err.message) && !/not an IP address literal/.test(err.message),
+      `"${entry}" must be reported as a missing interface name, not as a malformed IP`
+    );
+  }
+});
+
 // ── createAskGate / createAuthMiddleware: behaviour on fake req/res ──────────
 
 function fakeRes() {

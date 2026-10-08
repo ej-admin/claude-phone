@@ -508,3 +508,18 @@ test('D6: the startup log states the address:port pairs actually bound', async (
 
   assert.match(srv.output(), new RegExp(`127\\.0\\.0\\.1:${srv.port}`), 'an operator must be able to read the bind from the log');
 });
+
+test('D7: iface:<name> binds that interface\'s address (iface:lo is 127.0.0.1) and the log names the resolved address', async () => {
+  const srv = await startListening({ CLAUDE_API_LISTEN: 'iface:lo' });
+
+  assert.equal(await tcpOpen('127.0.0.1', srv.port), true, 'loopback is the lo interface\'s address');
+  assert.match(srv.output(), new RegExp(`127\\.0\\.0\\.1:${srv.port}`), 'the startup log shows the resolved address, not the iface: token');
+});
+
+test('D8: iface:<name> for a missing interface stops the server and nothing listens', async () => {
+  const srv = await startExpectingExit({ CLAUDE_API_LISTEN: '127.0.0.1,iface:nonexistent0' });
+
+  assert.notEqual(srv.exited().code, 0);
+  assert.equal(await tcpOpen('127.0.0.1', srv.port), false, 'all-or-nothing: the valid sibling must not be left listening');
+  assert.match(srv.output(), /no interface named "nonexistent0"/, 'the operator is told which interface is missing (not "not an IP address")');
+});
