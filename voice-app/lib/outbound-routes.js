@@ -280,11 +280,20 @@ router.post('/outbound-call', async function(req, res) {
           elapsed: Date.now() - startTime
         });
 
+        // HOME-5409: every reason outbound-handler.js can throw must land
+        // here as its OWN distinct label -- a config/auth failure bucketed
+        // into the generic 'error' catch-all is exactly the "wearing a
+        // safer label" failure mode this fix exists to close (ADV-6833).
         var reason = 'error';
         if (error.message === 'busy') reason = 'busy';
         else if (error.message === 'no_answer') reason = 'no_answer';
         else if (error.message === 'not_found') reason = 'not_found';
+        else if (error.message === 'forbidden') reason = 'forbidden';
         else if (error.message === 'service_unavailable') reason = 'service_unavailable';
+        else if (error.message === 'auth_failed') reason = 'auth_failed';
+        else if (error.message === 'sip_auth_not_configured') reason = 'sip_auth_not_configured';
+        else if (error.message === 'sip_trunk_not_configured') reason = 'sip_trunk_not_configured';
+        else if (error.message === 'no_signaling_response') reason = 'no_signaling_response';
 
         session.transition('FAILED', reason);
       }
