@@ -11,6 +11,12 @@ const logger = require('./logger');
 const { OutboundSession, getSession, getAllSessions } = require('./outbound-session');
 const { initiateOutboundCall, playMessage, hangupCall } = require('./outbound-handler');
 const { runConversationLoop } = require('./conversation-loop');
+const security = require('./api-security');
+
+// HOME-11645: the only destinations POST /api/outbound-call will dial (exact string match). Starts EMPTY,
+// so a router used before setupRoutes() runs refuses every call; setupRoutes() fills it from
+// OUTBOUND_ALLOWED_TO, and an empty or unset list stays empty (fail closed).
+var allowedDestinations = new Set();
 
 // Dependencies injected via setupRoutes()
 var srf = null;
@@ -26,10 +32,9 @@ var wsPort = 3001;
  * Validate phone number format
  */
 function isValidPhoneNumber(phoneNumber) {
-  if (typeof phoneNumber !== 'string') return false;
-  var e164Regex = /^\+[1-9]\d{1,14}$/;
-  var dialStringRegex = /^\d{1,15}$/;
-  return e164Regex.test(phoneNumber) || dialStringRegex.test(phoneNumber);
+  // One definition shared with the allowlist parser, so an allowlist entry can never be something this
+  // route would reject.
+  return security.isValidDestination(phoneNumber);
 }
 
 /**
@@ -118,6 +123,22 @@ router.post('/outbound-call', async function(req, res) {
         success: false,
         error: 'validation_failed',
         message: validation.error
+      });
+    }
+
+    // HOME-11645: dial only an allowlisted destination (exact string match). Checked before anything
+    // that could ring a phone. The refusal does not echo the list, and the log keeps only the last four
+    // digits of the refused number.
+    if (!security.isDestinationAllowed(allowedDestinations, req.body.to)) {
+      logger.warn('Outbound call refused: destination is not on the allowlist', {
+        toSuffix: String(req.body.to).slice(-4),
+        remoteAddress: req.socket && req.socket.remoteAddress
+      });
+
+      return res.status(403).json({
+        success: false,
+        error: 'destination_not_allowed',
+        message: 'Destination is not on the outbound allowlist'
       });
     }
 
@@ -396,13 +417,27 @@ function setupRoutes(deps) {
   ttsService = deps.ttsService || null;
   wsPort = deps.wsPort || 3001;
 
+  // HOME-11645: allowlist from deps (tests) or OUTBOUND_ALLOWED_TO (production). Read once, here: a change
+  // is a deliberate restart, not something a request can do.
+  var parsed = security.parseAllowedDestinations(
+    deps.allowedDestinations !== undefined ? deps.allowedDestinations : process.env.OUTBOUND_ALLOWED_TO
+  );
+  allowedDestinations = parsed.allowed;
+  if (parsed.ignored.length > 0) {
+    logger.warn('Outbound allowlist entries ignored (not a valid destination)', { count: parsed.ignored.length });
+  }
+  if (allowedDestinations.size === 0) {
+    logger.warn('Outbound allowlist is EMPTY: POST /api/outbound-call refuses every call (fail closed). Set OUTBOUND_ALLOWED_TO.');
+  }
+
   var conversationReady = !!(audioForkServer && whisperClient && claudeBridge && ttsService);
 
   logger.info('Outbound routes initialized', {
     srf: !!srf,
     mediaServer: !!mediaServer,
     deviceRegistry: !!deviceRegistry,
-    conversationMode: conversationReady ? 'enabled' : 'disabled'
+    conversationMode: conversationReady ? 'enabled' : 'disabled',
+    allowedDestinations: allowedDestinations.size
   });
 }
 

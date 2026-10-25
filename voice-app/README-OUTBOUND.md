@@ -10,6 +10,33 @@ The outbound calling API allows your server to call phone numbers and deliver me
 - Automated notifications
 - Two-way conversations triggered by events
 
+## Authentication and allowed destinations
+
+Every route on this API except `GET /health` requires the `X-Claude-Api-Key` header to equal the
+voice-app's `CLAUDE_API_KEY` (the same shared secret the Claude API server uses). Without it the answer is
+`401 {"success":false,"error":"unauthorized"}`, for unknown paths as well. **Every `curl` example below
+needs it:**
+
+```bash
+curl -H "X-Claude-Api-Key: $CLAUDE_API_KEY" http://localhost:3000/api/calls
+```
+
+If `CLAUDE_API_KEY` is unset or shorter than 32 characters the API is **locked**: every route except
+`/health` answers 401 and the startup log says so. The process still starts, because it is also the SIP
+endpoint and a missing variable must not take inbound calls down.
+
+`POST /api/outbound-call` only dials a destination listed in `OUTBOUND_ALLOWED_TO` (comma-separated, **exact
+string match**, no normalisation: `15555550100` is not `+15555550100`). Unset or empty means every call is
+refused (`403 destination_not_allowed`). An entry is either E.164 (`+15555550100`) or a bare digit dial
+string such as an extension; wildcards and anything else are ignored and counted in the startup log.
+
+```bash
+OUTBOUND_ALLOWED_TO=+15555550100,+15555550101
+```
+
+The generated audio and beeps the local FreeSWITCH fetches over `http://127.0.0.1:3000/audio-files/...` and
+`/static/...` are the one exemption: a `GET`/`HEAD` of a single file name from the local host needs no key.
+
 ## Endpoints
 
 ### POST /api/outbound-call
@@ -172,6 +199,8 @@ If `webhookUrl` is provided, POST requests are sent on state changes:
 | `Message too long` | Message exceeds 1000 chars |
 | `Call not found` | Invalid `callId` |
 | `service_unavailable` | SIP/media server not ready |
+| `unauthorized` (401) | Missing or wrong `X-Claude-Api-Key`, or the API is locked (no usable `CLAUDE_API_KEY`) |
+| `destination_not_allowed` (403) | `to` is not an exact match for an entry in `OUTBOUND_ALLOWED_TO` |
 
 ## Failure Reasons
 
