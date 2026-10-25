@@ -23,6 +23,9 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const SERVER = path.join(__dirname, '..', 'server.js');
+// GEN-10898: the server refuses to start without CLAUDE_API_KEY and 401s every route but /health.
+// Built at runtime: a token-shaped literal in a test file trips the credential scanner.
+const API_KEY = 'proxy-test-' + require('node:crypto').randomBytes(24).toString('hex');
 
 const ACKED_CALL_RECORD = {
   success: true,
@@ -76,6 +79,7 @@ async function startProxy(voiceAppUrl) {
   const child = spawn(process.execPath, [SERVER], {
     env: Object.assign({}, process.env, {
       PORT: String(port),
+      CLAUDE_API_KEY: API_KEY,
       VOICE_APP_URL: voiceAppUrl,
       OUTBOUND_LOG_PATH: path.join(logDir, 'outbound-calls.jsonl'),
       // HOME-10759: the proxy only dials allow-listed numbers (fail closed), and de-duplicates
@@ -120,7 +124,7 @@ test.after(async () => {
 async function postCall(body) {
   const res = await fetch(`${proxy.url}/outbound-call`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Claude-Api-Key': API_KEY },
     body: JSON.stringify(body)
   });
   return { status: res.status, body: await res.json() };
@@ -215,7 +219,7 @@ test('a non-boolean requireAck is a 400 and never reaches the voice-app (do not 
 });
 
 test('GET /outbound-call/:id returns the voice-app record, including ack, unchanged', async () => {
-  const res = await fetch(`${proxy.url}/outbound-call/call-1`);
+  const res = await fetch(`${proxy.url}/outbound-call/call-1`, { headers: { 'X-Claude-Api-Key': API_KEY } });
   const body = await res.json();
 
   assert.equal(res.status, 200);
