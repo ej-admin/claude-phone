@@ -203,6 +203,15 @@ npm run lint:fix      # Auto-fix issues
 | GET | `/api/calls` | List active calls |
 | POST | `/api/query` | Query device programmatically |
 | GET | `/api/devices` | List configured devices |
+| GET | `/health` | Health check (the only route that needs no key) |
+
+**Authentication (HOME-11645):** every route except `GET`/`HEAD /health` requires the `X-Claude-Api-Key` header
+to equal `CLAUDE_API_KEY` (the same shared secret as the Claude API server; constant-time compare, `401`
+otherwise, unknown paths included). With no usable key (unset, or under 32 characters) the API is **locked**:
+the process still starts, because it is also the SIP endpoint, and every route but `/health` answers `401`.
+`POST /api/outbound-call` dials only an exact string match on `OUTBOUND_ALLOWED_TO` (comma-separated; unset
+= every call refused, `403`). One exemption: FreeSWITCH's own `GET`/`HEAD` of a single file under
+`/audio-files/` or `/static/` from the local host needs no key.
 
 ### Claude API Server (port 3333)
 
@@ -239,7 +248,8 @@ See `.env.example` for all variables. Key ones:
 |----------|---------|
 | `EXTERNAL_IP` | Server LAN IP for RTP routing |
 | `CLAUDE_API_URL` | URL to claude-api-server |
-| `CLAUDE_API_KEY` | Shared secret sent as `X-Claude-Api-Key` (server: required, min 32 chars) |
+| `CLAUDE_API_KEY` | Shared secret sent as `X-Claude-Api-Key` (API server: required, min 32 chars; voice-app: required on its own HTTP API too, or that API is locked) |
+| `OUTBOUND_ALLOWED_TO` | Comma-separated exact-match destinations `POST /api/outbound-call` may dial (voice-app and API server; unset = refuse every call) |
 | `CLAUDE_API_ASK_ENABLED` | Server only: enable `/ask` + `/ask-structured` (default off) |
 | `CLAUDE_API_LISTEN` | Server only: comma-separated IPs or `iface:<name>` to bind (default loopback + tailnet) |
 | `ELEVENLABS_API_KEY` | TTS API key |
