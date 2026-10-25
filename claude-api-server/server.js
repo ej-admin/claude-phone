@@ -585,6 +585,12 @@ app.post('/end-session', (req, res) => {
 
 /* global AbortSignal */
 const VOICE_APP_URL = process.env.VOICE_APP_URL || 'http://ai-phone:3000';
+// HOME-11645: the voice-app requires the shared key on every route but GET/HEAD /health. It is the same
+// CLAUDE_API_KEY this server requires of its own callers (one secret per fleet). Sending it to a
+// voice-app that does not look at it is harmless, which is what lets this side ship before the Pi enforces.
+// `redirect: 'error'` on both calls: the voice-app never redirects, and a header must not follow a redirect
+// to another host.
+const VOICE_APP_AUTH_HEADERS = { [security.API_KEY_HEADER]: API_KEY };
 const OUTBOUND_LOG_PATH =
   process.env.OUTBOUND_LOG_PATH ||
   path.join(__dirname, 'logs', 'outbound-calls.jsonl');
@@ -714,7 +720,8 @@ async function dialVoiceApp(piPayload) {
   try {
     piResponse = await fetch(`${VOICE_APP_URL}/api/outbound-call`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: Object.assign({ 'Content-Type': 'application/json' }, VOICE_APP_AUTH_HEADERS),
+      redirect: 'error',
       body: JSON.stringify(piPayload),
       // Default 15s: the Pi just enqueues; the call itself takes longer to ring.
       signal: AbortSignal.timeout(OUTBOUND_PI_TIMEOUT_MS),
@@ -1025,6 +1032,8 @@ app.post('/outbound-call', async (req, res) => {
 async function proxyVoiceAppGet(res, piPath) {
   try {
     const r = await fetch(`${VOICE_APP_URL}${piPath}`, {
+      headers: VOICE_APP_AUTH_HEADERS,
+      redirect: 'error',
       signal: AbortSignal.timeout(OUTBOUND_GET_TIMEOUT_MS),
     });
     if (!r.ok) {

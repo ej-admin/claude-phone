@@ -13,6 +13,8 @@ const path = require('path');
 const fs = require('fs').promises;
 const debug = require('debug')('voice-app:http-server');
 const crypto = require('crypto');
+const logger = require('./logger');
+const security = require('./api-security');
 
 // Cleanup interval: every 2 minutes
 const CLEANUP_INTERVAL = 120000;
@@ -24,10 +26,32 @@ const FILE_MAX_AGE = 600000;
  *
  * @param {string} audioDir - Directory to serve audio files from
  * @param {number} port - Port to listen on (default: 3000)
+ * @param {Object} [options]
+ * @param {Object} [options.env] - environment to read CLAUDE_API_KEY from (default: process.env)
+ * @param {Function} [options.isLocalRequest] - "is this request from this host" (default: loopback peer);
+ *   injectable so a test can stand in for a remote peer
  * @returns {Object} { app, server, saveAudio, getAudioUrl, close, finalize }
  */
-function createHttpServer(audioDir, port = 3000) {
+function createHttpServer(audioDir, port = 3000, options = {}) {
   const app = express();
+
+  // HOME-11645: authenticate EVERY route (X-Claude-Api-Key) except GET/HEAD /health and FreeSWITCH's own
+  // loopback fetches of generated audio. Mounted first: before the body parser, so an unauthenticated
+  // caller never reaches it, and before every route (including ones added later by index.js and routes
+  // that do not exist), so there is no path that is routable but unguarded.
+  const keyResult = security.loadApiKey(options.env || process.env);
+  if (!keyResult.ok) {
+    // Locked, not crashed: this process is also the SIP endpoint, and a missing env var must not take
+    // inbound calls down. Every API call is a 401 until the key is set, and this line says why.
+    logger.error('voice-app HTTP API is LOCKED (every route except /health answers 401): ' + keyResult.error);
+  }
+  app.use(security.createAuthMiddleware({
+    key: keyResult.ok ? keyResult.key : null,
+    isLocalRequest: options.isLocalRequest,
+    onDenied: function(info) {
+      logger.warn('HTTP API request denied (401)', info);
+    }
+  }));
 
   // Parse JSON bodies
   app.use(express.json());

@@ -59,6 +59,19 @@ function loadModules() {
   }
 }
 
+/**
+ * outbound-session keeps a finished session for 60 s with a plain setTimeout, which would hold this test
+ * process open for a minute after the last assertion. Unref only the long timers (the tests' own sleeps
+ * are 50-100 ms and are untouched) and put the real setTimeout back when the file is done.
+ */
+const realSetTimeout = global.setTimeout;
+global.setTimeout = (fn, ms, ...args) => {
+  const timer = realSetTimeout(fn, ms, ...args);
+  if (typeof ms === 'number' && ms >= 10000 && timer && typeof timer.unref === 'function') timer.unref();
+  return timer;
+};
+test.after(() => { global.setTimeout = realSetTimeout; });
+
 function withEnv(vars, fn) {
   const saved = {};
   for (const name of Object.keys(vars)) {

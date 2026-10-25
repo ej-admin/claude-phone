@@ -165,3 +165,55 @@ test('the key is never put in the request body or URL sent to the voice-app', as
     assert.ok(!r.body.includes(API_KEY), 'key in body');
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// A header must not follow a redirect
+// ---------------------------------------------------------------------------------------------
+
+test('a voice-app that answers with a redirect does not receive the key a second time at the redirect target', async () => {
+  // "other" stands in for any host the voice-app could bounce us to. It records everything it receives.
+  const other = { requests: [] };
+  other.server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      other.requests.push({ method: req.method, url: req.url, key: req.headers['x-claude-api-key'] });
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ success: true, data: [] }));
+    });
+  });
+  await new Promise((resolve) => other.server.listen(0, '127.0.0.1', resolve));
+  const otherUrl = `http://127.0.0.1:${other.server.address().port}`;
+
+  const redirector = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      // 307 keeps the method and the headers on a follow, which is the dangerous case for a POST.
+      res.statusCode = 307;
+      res.setHeader('Location', `${otherUrl}${req.url}`);
+      res.end();
+    });
+  });
+  await new Promise((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+  const redirectingProxy = await startProxy(`http://127.0.0.1:${redirector.address().port}`);
+
+  try {
+    const get = await fetch(`${redirectingProxy.url}/outbound-calls`, { headers: { 'X-Claude-Api-Key': API_KEY } });
+    await get.text();
+    assert.equal(get.status, 502, 'a redirect from the voice-app is a failed proxy call, not something to follow');
+
+    const post = await fetch(`${redirectingProxy.url}/outbound-call`, {
+      method: 'POST',
+      headers: { 'X-Claude-Api-Key': API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: ALLOWED, message: 'redirect check', mode: 'announce' })
+    });
+    await post.text();
+    assert.ok([502, 504].includes(post.status), `unexpected status ${post.status}`);
+
+    await sleep(100);
+    assert.deepEqual(other.requests, [], 'nothing may be sent to the redirect target, so the key cannot leak there');
+  } finally {
+    redirectingProxy.child.kill();
+    await new Promise((resolve) => redirector.close(resolve));
+    await new Promise((resolve) => other.server.close(resolve));
+  }
+});
