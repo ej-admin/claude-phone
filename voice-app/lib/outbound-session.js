@@ -33,6 +33,17 @@ class OutboundSession extends EventEmitter {
     this.createdAt = Date.now();
     this.answeredAt = null;
     this.endedAt = null;
+    // The reason of the most recent transition that carried one (e.g. 'acknowledged', 'ack_timeout',
+    // 'remote_hangup'), exposed as `reason` on getInfo() so a poller of GET /api/call/:callId can see WHY a call
+    // ended, not only that it did.
+    this.lastReason = null;
+
+    // HOME-10660: human acknowledgement (DTMF 1). Only calls that ASK for one
+    // (requireAck) ever listen, so only they may report one. `ack` stays null until
+    // the listener presses 1; getInfo() exposes the key from creation for these calls
+    // (null = "listened, heard none") and omits it for calls that never listened.
+    this.ackRequested = options.requireAck === true;
+    this.ack = null;
 
     // Media objects
     this.endpoint = null;
@@ -42,11 +53,15 @@ class OutboundSession extends EventEmitter {
     this.conversationHistory = [];
     this.turnCount = 0;
 
-    // Register in active sessions
-    activeSessions.set(callId, this);
+    // Register in active sessions.
+    // GEN-12926: key on this.callId, NOT the raw constructor parameter. The one call site
+    // (POST /api/outbound-call) passes null so a UUID is generated; registering under the raw parameter stored
+    // every session under the key null, so getSession(realCallId) -- and GET /api/call/:callId -- never found it
+    // and an answered call (or a captured acknowledgement) read as not_found.
+    activeSessions.set(this.callId, this);
 
     logger.info('Outbound session created', {
-      callId,
+      callId: this.callId,
       to: this.to,
       mode: this.mode,
       state: this.state
@@ -67,6 +82,9 @@ class OutboundSession extends EventEmitter {
     }
 
     this.state = newState;
+    if (reason) {
+      this.lastReason = reason;
+    }
 
     const logData = {
       callId: this.callId,
@@ -98,12 +116,43 @@ class OutboundSession extends EventEmitter {
     if (newState === 'COMPLETED' || newState === 'FAILED') {
       this.endedAt = Date.now();
 
-      // Keep session for 1 minute for status queries, then remove
-      setTimeout(() => {
+      // Keep session for 1 minute for status queries, then remove.
+      // unref(): this bookkeeping timer must never be the thing that keeps a process alive.
+      const cleanupTimer = setTimeout(() => {
         activeSessions.delete(this.callId);
         logger.info('Session cleaned up', { callId: this.callId });
       }, 60000);
+      if (typeof cleanupTimer.unref === 'function') {
+        cleanupTimer.unref();
+      }
     }
+  }
+
+  /**
+   * Record the listener's acknowledgement (DTMF 1).
+   * First ack wins: a repeated keypress must not move the timestamp. Refused on a
+   * call that never asked for one -- it never listened, so it cannot have heard one.
+   *
+   * @param {{method: string, digit: string, at: string}} ack
+   * @returns {boolean} true if this ack was recorded
+   */
+  recordAck(ack) {
+    if (!this.ackRequested) {
+      logger.warn('Ignoring acknowledgement on a call that did not request one', { callId: this.callId });
+      return false;
+    }
+    if (this.ack) {
+      return false;
+    }
+
+    this.ack = { method: ack.method, digit: String(ack.digit), at: ack.at };
+    logger.info('Call acknowledged by listener', {
+      callId: this.callId,
+      method: this.ack.method,
+      digit: this.ack.digit,
+      at: this.ack.at
+    });
+    return true;
   }
 
   /**
@@ -275,8 +324,18 @@ class OutboundSession extends EventEmitter {
       createdAt: new Date(this.createdAt).toISOString(),
       answeredAt: this.answeredAt ? new Date(this.answeredAt).toISOString() : null,
       endedAt: this.endedAt ? new Date(this.endedAt).toISOString() : null,
-      duration: this.getDuration()
+      duration: this.getDuration(),
+      reason: this.lastReason,
+      ackRequested: this.ackRequested
     };
+
+    // HOME-10660: contract with the escalation consumer (humanAcknowledgement):
+    //   ack: { method:'dtmf', digit:'1', at:<ISO> }  a person pressed 1
+    //   ack: null                                      listened, heard none (yet)
+    //   (key absent)                                   this call never listened
+    if (this.ackRequested) {
+      info.ack = this.ack ? Object.assign({}, this.ack) : null;
+    }
 
     // Include conversation stats for conversation mode
     if (this.mode === 'conversation') {
