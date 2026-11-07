@@ -67,7 +67,7 @@ Initiate an outbound call.
 | `timeoutSeconds` | No | Ring timeout 5-120 (default: 30) |
 | `webhookUrl` | No | URL for status callbacks |
 | `requireAck` | No | `true` (announce mode only): append "Press 1 to acknowledge" and record the keypress. See [Acknowledgement](#acknowledgement-dtmf-1) |
-| `triggeredBy` | No | Who placed the call (max 100 chars). A value on `OUTBOUND_ACK_TRIGGERS` implies `requireAck` unless `requireAck:false` |
+| `triggeredBy` | No | Who placed the call (max 256 chars). A value on `OUTBOUND_ACK_TRIGGERS` (or one of them followed by `:` and a suffix, e.g. `telegram-drainer-escalation:42`) implies `requireAck` unless `requireAck:false` |
 
 **Response:**
 
@@ -179,7 +179,10 @@ press 1 and report whether they did.
 
 A call asks for this when `requireAck` is `true`, or when `triggeredBy` is on the
 allow-list `OUTBOUND_ACK_TRIGGERS` (default: `telegram-drainer-escalation`) and
-`requireAck` is not `false`. Announce mode only. The spoken script becomes the message
+`requireAck` is not `false`. A `triggeredBy` is on the list when it equals an entry or is
+an entry followed by `:` and a suffix (`telegram-drainer-escalation:42`,
+`telegram-drainer-escalation:batch:42,43`); `telegram-drainer-escalation-x` is not.
+Announce mode only. The spoken script becomes the message
 followed by "Press 1 to acknowledge." The voice-app then listens for up to
 `OUTBOUND_ACK_TIMEOUT_MS` (default 10000) after the prompt; pressing 1 during the
 message also counts. On acknowledgement it plays a short confirmation and hangs up.

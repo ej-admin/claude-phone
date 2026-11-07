@@ -101,8 +101,10 @@ function validateRequest(body) {
     return { valid: false, error: 'Field "requireAck" is only supported in announce mode (conversation mode owns DTMF itself)' };
   }
 
-  if (body.triggeredBy !== undefined && (typeof body.triggeredBy !== 'string' || body.triggeredBy.length > 100)) {
-    return { valid: false, error: 'Field "triggeredBy" must be a string of 100 characters or less' };
+  // GEN-12926: 256, not 100. The escalation consumer caps its coalesced-batch label at 200 characters and a 100
+  // limit made any batch of roughly a dozen rows a 400 -- a provenance label must not stop the call being placed.
+  if (body.triggeredBy !== undefined && (typeof body.triggeredBy !== 'string' || body.triggeredBy.length > 256)) {
+    return { valid: false, error: 'Field "triggeredBy" must be a string of 256 characters or less' };
   }
 
   return { valid: true };

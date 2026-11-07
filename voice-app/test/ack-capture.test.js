@@ -83,6 +83,35 @@ test('shouldRequireAck: the drainer escalation trigger opts in by default (no dr
   );
 });
 
+// GEN-12926: the escalation consumer does not send the bare trigger. It appends the row it is escalating
+// ("<trigger>:<rowId>") or, for a coalesced call, "<trigger>:batch:<id>,<id>,...". An exact-match allow-list never
+// matched either form, so no real escalation was ever asked to press 1 and every answered call still ended
+// "ack unsupported". These pin the shapes the consumer really sends.
+test('GEN-12926: the triggeredBy the escalation consumer really sends (":<rowId>" and ":batch:<ids>") opts in by default', () => {
+  assert.equal(shouldRequireAck({ triggeredBy: 'telegram-drainer-escalation:30561' }, {}), true, 'single-row form');
+  assert.equal(shouldRequireAck({ triggeredBy: 'telegram-drainer-escalation:batch:30561,30562,30563' }, {}), true, 'coalesced form');
+});
+
+test('GEN-12926: a trigger matches only itself or itself + ":" + suffix; look-alikes do not opt in', () => {
+  for (const lookalike of [
+    'telegram-drainer-escalation-evil',
+    'telegram-drainer-escalationX:1',
+    'xtelegram-drainer-escalation:1',
+    'telegram-drainer',
+    'not-telegram-drainer-escalation:1'
+  ]) {
+    assert.equal(shouldRequireAck({ triggeredBy: lookalike }, {}), false, `${lookalike} must not opt in`);
+  }
+});
+
+test('GEN-12926: a configured trigger also matches its ":suffix" form, and still only that', () => {
+  const env = { OUTBOUND_ACK_TRIGGERS: 'ralph-page, watchdog-phone-chain' };
+  assert.equal(shouldRequireAck({ triggeredBy: 'ralph-page' }, env), true);
+  assert.equal(shouldRequireAck({ triggeredBy: 'ralph-page:42' }, env), true);
+  assert.equal(shouldRequireAck({ triggeredBy: ' watchdog-phone-chain:7 ' }, env), true, 'surrounding whitespace is trimmed');
+  assert.equal(shouldRequireAck({ triggeredBy: 'ralph-pager:42' }, env), false);
+});
+
 test('shouldRequireAck: an unrelated or absent triggeredBy does not opt in', () => {
   assert.equal(shouldRequireAck({ triggeredBy: 'mcp-telephony' }, {}), false, 'unlisted trigger must not get the prompt');
   assert.equal(shouldRequireAck({}, {}), false, 'no requireAck and no triggeredBy must not get the prompt');

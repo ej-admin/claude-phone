@@ -250,6 +250,50 @@ test('GEN-12926: an escalation call to a destination that is not allowlisted is 
   assert.equal(dials, 0, 'the media layer was never asked to dial');
 });
 
+// --- the triggeredBy the escalation consumer really sends (GEN-12926) ------------------------------------------
+
+test('GEN-12926: a consumer-shaped triggeredBy (row id suffix) gets the Press-1 prompt end to end', async () => {
+  const scenario = makeScenario({ blockFirstPlay: true });
+  stub.handler = scenario;
+
+  const created = await postCall(Object.assign({}, ESCALATION, { triggeredBy: 'telegram-drainer-escalation:30561' }));
+  assert.equal(created.status, 200);
+  await scenario.firstPlayStarted;
+
+  assert.equal(scenario.played[0], 'Disk is full. Press 1 to acknowledge.', 'the real trigger form must ask the listener to press 1');
+  const waiting = (await getCall(created.body.callId)).body.data;
+  assert.equal(waiting.ackRequested, true);
+  assert.equal(waiting.ack, null, 'listening, nothing pressed yet');
+
+  scenario.endpoint.emit('dtmf', { dtmf: '1', duration: '2000', source: 'RTP' });
+  const done = await waitForState(created.body.callId, ['COMPLETED', 'FAILED']);
+  assert.equal(done.reason, 'acknowledged');
+  assert.equal(done.ack.digit, '1');
+});
+
+test('GEN-12926: a 200-char coalesced-batch triggeredBy (the consumer\'s own cap) is accepted and prompts, never a 400', async () => {
+  const scenario = makeScenario({ blockFirstPlay: true });
+  stub.handler = scenario;
+  const batch = ('telegram-drainer-escalation:batch:' + Array.from({ length: 30 }, (_, i) => String(30000 + i)).join(',')).slice(0, 200);
+  assert.equal(batch.length, 200, 'precondition: the longest value the consumer can send');
+
+  const created = await postCall(Object.assign({}, ESCALATION, { triggeredBy: batch }));
+  assert.equal(created.status, 200, 'a long provenance label must not stop an escalation call from being placed');
+  await scenario.firstPlayStarted;
+  assert.equal(scenario.played[0], 'Disk is full. Press 1 to acknowledge.');
+
+  scenario.endpoint.emit('dtmf', { dtmf: '1', duration: '2000', source: 'RTP' });
+  await waitForState(created.body.callId, ['COMPLETED', 'FAILED']);
+});
+
+test('GEN-12926: a triggeredBy beyond 256 characters is still a 400 (bounded, and it says so)', async () => {
+  const res = await postCall(Object.assign({}, ESCALATION, { triggeredBy: 'x'.repeat(257) }));
+
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'validation_failed');
+  assert.match(res.body.message, /256/, 'the error names the limit');
+});
+
 // --- request validation ---------------------------------------------------------
 
 test('requireAck must be a boolean', async () => {

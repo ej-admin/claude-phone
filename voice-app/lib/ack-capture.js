@@ -24,8 +24,10 @@ const ACK_DIGIT = '1';
 const ACK_PROMPT = 'Press 1 to acknowledge.';
 const ACK_CONFIRMATION = 'Acknowledged. Thank you. Goodbye.';
 
-// The escalation consumer sends exactly this triggeredBy and nothing else that marks a call as an
-// escalation, so it is the default opt-in. Override with OUTBOUND_ACK_TRIGGERS (comma-separated; empty = none).
+// The escalation consumer marks its calls with this trigger and nothing else marks a call as an escalation, so it is
+// the default opt-in. The consumer does not send it bare: it appends the row it is escalating ("<trigger>:<rowId>") or,
+// for a coalesced call, "<trigger>:batch:<id>,<id>,..." -- see matchesTrigger. Override with OUTBOUND_ACK_TRIGGERS
+// (comma-separated; empty = none).
 const DEFAULT_ACK_TRIGGERS = ['telegram-drainer-escalation'];
 
 const DEFAULT_ACK_TIMEOUT_MS = 10000;
@@ -41,6 +43,16 @@ function getAckTriggers(env) {
 }
 
 /**
+ * A call's triggeredBy matches a configured trigger when it IS the trigger or the trigger followed by ":" and a
+ * suffix. The ":" boundary is deliberate: "<trigger>-evil" or "<trigger>X" must not opt a call in, while the
+ * "<trigger>:<rowId>" form the consumer really sends must (GEN-12926: an exact-match list never matched it, so no
+ * real escalation was ever asked to press 1).
+ */
+function matchesTrigger(triggeredBy, trigger) {
+  return triggeredBy === trigger || triggeredBy.startsWith(`${trigger}:`);
+}
+
+/**
  * Should this call ask the listener to press 1?
  * An explicit boolean requireAck always wins; otherwise the call opts in when its
  * triggeredBy is on the allow-list.
@@ -53,7 +65,8 @@ function shouldRequireAck(body, env = process.env) {
   if (!body || typeof body !== 'object') return false;
   if (typeof body.requireAck === 'boolean') return body.requireAck;
   if (typeof body.triggeredBy !== 'string') return false;
-  return getAckTriggers(env).includes(body.triggeredBy.trim());
+  const by = body.triggeredBy.trim();
+  return getAckTriggers(env).some((trigger) => matchesTrigger(by, trigger));
 }
 
 /**
