@@ -33,6 +33,11 @@ class OutboundSession extends EventEmitter {
     this.createdAt = Date.now();
     this.answeredAt = null;
     this.endedAt = null;
+    // HOME-5409: last transition reason, surfaced via getInfo() so a FAILED
+    // call's reason (e.g. 'sip_auth_not_configured', 'no_signaling_response')
+    // is visible to external callers polling GET /call/:callId -- not just
+    // buried in server logs. Without this, "loud" only reached the log file.
+    this.lastReason = null;
 
     // Media objects
     this.endpoint = null;
@@ -42,11 +47,20 @@ class OutboundSession extends EventEmitter {
     this.conversationHistory = [];
     this.turnCount = 0;
 
-    // Register in active sessions
-    activeSessions.set(callId, this);
+    // Register in active sessions.
+    // HOME-5409: this MUST be this.callId, not the raw `callId` constructor
+    // param -- the sole call site (outbound-routes.js) always passes null
+    // here specifically so a UUID gets generated, which meant every session
+    // was ALWAYS stored under key `null` and getSession(realCallId) could
+    // never find it. GET /call/:callId has returned 'not_found' for every
+    // outbound call ever placed via this path, including calls that were
+    // fully answered -- confirmed live: "Outbound session created
+    // {\"callId\":null,...}" in production logs is this exact bug caught
+    // in the act, not a hypothetical.
+    activeSessions.set(this.callId, this);
 
     logger.info('Outbound session created', {
-      callId,
+      callId: this.callId,
       to: this.to,
       mode: this.mode,
       state: this.state
@@ -67,6 +81,9 @@ class OutboundSession extends EventEmitter {
     }
 
     this.state = newState;
+    if (reason) {
+      this.lastReason = reason;
+    }
 
     const logData = {
       callId: this.callId,
@@ -275,7 +292,8 @@ class OutboundSession extends EventEmitter {
       createdAt: new Date(this.createdAt).toISOString(),
       answeredAt: this.answeredAt ? new Date(this.answeredAt).toISOString() : null,
       endedAt: this.endedAt ? new Date(this.endedAt).toISOString() : null,
-      duration: this.getDuration()
+      duration: this.getDuration(),
+      reason: this.lastReason
     };
 
     // Include conversation stats for conversation mode
